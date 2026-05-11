@@ -335,3 +335,23 @@ def test_export_html_download_param_sets_disposition(client):
 def test_export_html_404_for_missing_run(client):
     r = client.get("/api/runs/ghost/export.html")
     assert r.status_code == 404
+
+
+# ---------- /health ----------
+
+def test_health_no_auth_required(client):
+    # Note: the global `client` fixture sets ENDLEX_TOKEN. The health endpoint
+    # should answer without an Authorization header regardless.
+    r = client.get("/health")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "ok"
+    assert "version" in body
+    assert body["runs"] == 0
+
+
+def test_health_counts_runs(client):
+    _init(client, "alpha")
+    _init(client, "beta")
+    r = client.get("/health")
+    assert r.json()["runs"] == 2

@@ -72,6 +72,25 @@ StorageDep = Annotated[Storage, Depends(_storage_of)]
 
 
 def _register_routes(app: FastAPI) -> None:  # noqa: C901 — long but flat
+    @app.get("/health")
+    async def health(storage: StorageDep):
+        """Unauthenticated liveness/readiness probe.
+
+        Cheap on purpose — just counts run directories. Don't add expensive
+        work here; monitoring agents poll this every few seconds.
+        """
+        try:
+            n_runs = sum(
+                1 for p in storage.runs_dir.iterdir() if p.is_dir()
+            )
+        except OSError:
+            n_runs = -1
+        return {
+            "status": "ok",
+            "version": app.version,
+            "runs": n_runs,
+        }
+
     @app.exception_handler(InvalidName)
     async def _bad_name(_: Request, exc: InvalidName):
         return JSONResponse({"error": str(exc)}, status_code=400)
