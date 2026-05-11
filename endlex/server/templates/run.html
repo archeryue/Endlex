@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>{{ name }} &mdash; Endlex</title>
+</head>
+<body>
+  <h1>{{ name }}</h1>
+  <h2>Config</h2>
+  <pre>{{ config | tojson(indent=2) }}</pre>
+  <h2>Checkpoints</h2>
+  <ul>
+    {% for ck in checkpoints %}
+      <li>{{ ck.step }}: {{ ck.files | join(", ") }}</li>
+    {% else %}
+      <li><em>none</em></li>
+    {% endfor %}
+  </ul>
+</body>
+</html>

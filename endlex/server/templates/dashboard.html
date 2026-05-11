@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Endlex</title>
+</head>
+<body>
+  <h1>Endlex runs</h1>
+  <ul>
+    {% for run in runs %}
+      <li><a href="/run/{{ run.name }}">{{ run.name }}</a> &mdash; {{ run.num_events }} events</li>
+    {% else %}
+      <li><em>no runs yet</em></li>
+    {% endfor %}
+  </ul>
+</body>
+</html>
