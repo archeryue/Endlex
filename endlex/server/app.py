@@ -227,6 +227,11 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 — long but flat
         storage: StorageDep,
         since: int = Query(default=0, ge=0),
         poll_interval: float = Query(default=0.5, ge=0.05, le=5.0),
+        max_lifetime: float = Query(
+            default=float(os.environ.get("ENDLEX_SSE_MAX_LIFETIME_SEC", "3600")),
+            ge=1.0,
+            le=86400.0,
+        ),
     ):
         # Validate up front so a typo doesn't return a 200 SSE that errors mid-stream.
         if not storage.run_exists(name):
@@ -235,10 +240,25 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 — long but flat
         async def gen():
             cursor = since
             yield b": stream open\n\n"
-            last_keepalive = asyncio.get_event_loop().time()
+            start = asyncio.get_event_loop().time()
+            last_keepalive = start
             while True:
-                if await request.is_disconnected():
+                # Cap the lifetime so a wedged client can't pin a thread forever.
+                if asyncio.get_event_loop().time() - start > max_lifetime:
                     return
+                # Race the disconnect signal with the poll interval. On
+                # http.disconnect, receive() returns immediately; otherwise
+                # wait_for times out and we proceed to read the file. This
+                # replaces the brittle is_disconnected() polling pattern that
+                # leaks the gen when the client closes silently.
+                try:
+                    msg = await asyncio.wait_for(
+                        request.receive(), timeout=poll_interval
+                    )
+                    if msg.get("type") == "http.disconnect":
+                        return
+                except asyncio.TimeoutError:
+                    pass  # no signal in this window — normal path
                 # Run sync file IO off the event loop to avoid blocking peers.
                 events, new_cursor = await asyncio.to_thread(
                     storage.read_metrics, name, since_offset=cursor
@@ -256,7 +276,6 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 — long but flat
                 if now - last_keepalive > 30:
                     yield b": keep-alive\n\n"
                     last_keepalive = now
-                await asyncio.sleep(poll_interval)
 
         return StreamingResponse(
             gen(),

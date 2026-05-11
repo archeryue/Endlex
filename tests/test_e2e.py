@@ -124,6 +124,57 @@ def test_sse_stream_404_for_missing_run(live_server):
         assert r.status_code == 404
 
 
+def test_sse_stream_hard_lifetime_closes_gen(live_server):
+    """A short max_lifetime should let the server close the gen on its own,
+    proving the lifetime cap actually triggers (defense-in-depth against
+    wedged clients)."""
+    import time as _t
+
+    url, _ = live_server
+    auth = {"Authorization": "Bearer e2e-tok"}
+    with httpx.Client(base_url=url) as c:
+        assert c.post("/api/runs/lt/init", json={}, headers=auth).status_code == 200
+
+    t0 = _t.time()
+    with httpx.Client(base_url=url, timeout=10.0) as c:
+        # 0.5s lifetime cap → server closes the chunked stream after ~0.5s.
+        with c.stream(
+            "GET",
+            "/api/runs/lt/metrics/stream?poll_interval=0.1&max_lifetime=1.0",
+        ) as r:
+            assert r.status_code == 200
+            # iter_raw exits cleanly when the server closes the chunked stream.
+            for _ in r.iter_raw():
+                pass
+    elapsed = _t.time() - t0
+    # Should be ~1s; allow 4s headroom for slow CI.
+    assert 0.5 < elapsed < 4.0, f"stream lifetime {elapsed:.2f}s outside expected window"
+
+
+def test_sse_stream_exits_on_client_disconnect(live_server):
+    """Open a stream, close it from the client, then confirm the server is
+    still responsive (would deadlock or 500 if the disconnect leaked)."""
+    url, _ = live_server
+    auth = {"Authorization": "Bearer e2e-tok"}
+    with httpx.Client(base_url=url) as c:
+        assert c.post("/api/runs/dc/init", json={}, headers=auth).status_code == 200
+
+    with httpx.Client(base_url=url, timeout=5.0) as c:
+        with c.stream(
+            "GET", "/api/runs/dc/metrics/stream?poll_interval=0.05"
+        ) as r:
+            assert r.status_code == 200
+            # Read one byte then close.
+            for chunk in r.iter_raw():
+                if chunk:
+                    break
+
+    # The server should still answer a follow-up request promptly.
+    with httpx.Client(base_url=url, timeout=2.0) as c:
+        r = c.get("/api/runs")
+        assert r.status_code == 200
+
+
 def test_offline_tracker_still_logs_locally(tmp_path: Path, monkeypatch):
     """If ENDLEX_URL is unset the tracker must still produce a full local JSONL."""
     monkeypatch.delenv("ENDLEX_URL", raising=False)
