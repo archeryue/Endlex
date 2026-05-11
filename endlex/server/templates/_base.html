@@ -43,7 +43,7 @@
 
     /* Top nav */
     nav.top {
-      display: flex; align-items: center; gap: 1rem;
+      display: flex; align-items: center; flex-wrap: wrap; gap: .5rem 1rem;
       padding-bottom: .85rem; margin-bottom: 1.5rem;
       border-bottom: 1px solid var(--border);
     }
@@ -55,6 +55,7 @@
     nav.top .right { margin-left: auto; display: flex; gap: .5rem; align-items: center; }
 
     /* Tables */
+    .table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
     table { border-collapse: collapse; width: 100%; }
     th, td { padding: .55rem .8rem; text-align: left; border-bottom: 1px solid var(--border); }
     th { color: var(--muted); font-weight: 600; font-size: .8rem; text-transform: uppercase; letter-spacing: .04em; }

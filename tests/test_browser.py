@@ -353,6 +353,26 @@ def test_run_page_archive_button_works(live_server, tmp_path: Path, page: Page):
     expect(page.locator("#btn-archive")).to_have_text("Unarchive", timeout=5000)
 
 
+def test_dashboard_remains_usable_at_narrow_viewport(
+    live_server, tmp_path: Path, browser
+):
+    """At ~mobile widths the table can scroll horizontally and key elements
+    (brand, run links) stay visible."""
+    url, _ = live_server
+    _seed(url, tmp_path, name="alpha")
+
+    ctx = browser.new_context(viewport={"width": 420, "height": 800})
+    page = ctx.new_page()
+    page.goto(url)
+    expect(page.locator("a.brand")).to_be_visible()
+    expect(page.get_by_role("link", name="alpha")).to_be_visible()
+    # Table is in an overflow-x:auto wrapper so it doesn't break layout.
+    wrapper = page.locator(".table-scroll").first
+    assert wrapper.evaluate("el => getComputedStyle(el).overflowX") == "auto"
+    page.screenshot(path="/tmp/endlex-dashboard-narrow.png", full_page=True)
+    ctx.close()
+
+
 def test_dashboard_dark_mode(live_server, tmp_path: Path, browser):
     """Sanity-check that the dark-mode palette renders without breaking layout."""
     url, _ = live_server
