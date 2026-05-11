@@ -383,6 +383,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 — long but flat
                 "name": name,
                 "config": storage.get_config(name),
                 "summary": asdict(storage.summarize_run(name)),
+                "state": storage.get_state(name),
                 "checkpoints": storage.list_checkpoints(name),
             },
         )

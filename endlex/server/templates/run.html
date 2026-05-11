@@ -44,6 +44,20 @@
   {% endif %}
 </details>
 
+<details {% if state.notes %}open{% endif %}>
+  <summary>Notes</summary>
+  <textarea
+    id="notes"
+    rows="5"
+    placeholder="Free-form notes: hypothesis, what to try next, what went wrong…"
+    style="width: 100%; max-width: 60rem; margin-top: .5rem; padding: .5rem .65rem; background: var(--card); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; font: inherit; resize: vertical;"
+  >{{ state.notes }}</textarea>
+  <div style="margin-top: .35rem; display: flex; gap: .5rem; align-items: center;">
+    <button id="btn-save-notes" class="primary">Save notes</button>
+    <span id="notes-status" class="muted" style="font-size:.85rem;"></span>
+  </div>
+</details>
+
 <h2>Charts</h2>
 <div id="charts" class="grid"></div>
 <div id="charts-empty" class="empty" style="display:none;">
@@ -267,6 +281,31 @@
       if (!r.ok && r.status !== 204) throw new Error(`HTTP ${r.status}`);
       location.href = "/";
     } catch (e) { alert(`Delete failed: ${e.message}`); }
+  });
+
+  // ----- notes -----
+  const notesEl = document.getElementById("notes");
+  const btnSaveNotes = document.getElementById("btn-save-notes");
+  const notesStatus = document.getElementById("notes-status");
+  btnSaveNotes.addEventListener("click", async () => {
+    btnSaveNotes.disabled = true;
+    notesStatus.textContent = "saving…";
+    try {
+      const r = await endlex.authedFetch(
+        `/api/runs/${encodeURIComponent(RUN)}/state`,
+        {
+          method: "PATCH",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({notes: notesEl.value}),
+        }
+      );
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      notesStatus.textContent = `saved ${new Date().toLocaleTimeString()}`;
+    } catch (e) {
+      notesStatus.textContent = `error: ${e.message}`;
+    } finally {
+      btnSaveNotes.disabled = false;
+    }
   });
 })();
 </script>

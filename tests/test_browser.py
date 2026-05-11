@@ -294,6 +294,23 @@ def test_run_page_upgrades_to_sse(live_server, tmp_path: Path, page: Page):
     expect(page.locator("#status")).to_contain_text("(live)", timeout=10_000)
 
 
+def test_run_page_notes_edit_persists(live_server, tmp_path: Path, page: Page):
+    """Type notes, save, reload — they should still be there."""
+    url, _ = live_server
+    _seed(url, tmp_path, name="r")
+    page.add_init_script("localStorage.setItem('endlex_token', 'e2e-tok')")
+    page.goto(f"{url}/run/r")
+    # Open the Notes <details>.
+    page.locator("summary", has_text="Notes").click()
+    page.locator("#notes").fill("hypothesis: lr too high")
+    page.locator("#btn-save-notes").click()
+    expect(page.locator("#notes-status")).to_contain_text("saved", timeout=5_000)
+    # Reload and confirm persistence.
+    page.reload()
+    page.locator("summary", has_text="Notes").click()
+    expect(page.locator("#notes")).to_have_value("hypothesis: lr too high")
+
+
 def test_run_page_archive_button_works(live_server, tmp_path: Path, page: Page):
     url, _ = live_server
     _seed(url, tmp_path, name="r")

@@ -145,7 +145,26 @@ def test_get_state_defaults(store: Storage):
         "tags": [],
         "archived": False,
         "retention": {},
+        "notes": "",
     }
+
+
+def test_update_state_persists_notes(store: Storage):
+    store.init_run("r", {})
+    store.update_state("r", {"notes": "this is the one that almost worked"})
+    assert store.get_state("r")["notes"] == "this is the one that almost worked"
+
+
+def test_update_state_rejects_non_string_notes(store: Storage):
+    store.init_run("r", {})
+    with pytest.raises(InvalidName):
+        store.update_state("r", {"notes": 123})
+
+
+def test_update_state_rejects_oversize_notes(store: Storage):
+    store.init_run("r", {})
+    with pytest.raises(InvalidName):
+        store.update_state("r", {"notes": "x" * 100_001})
 
 
 def test_update_state_persists_tags(store: Storage):

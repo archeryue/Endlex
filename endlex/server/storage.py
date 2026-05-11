@@ -235,15 +235,26 @@ class Storage:
     def _read_state(run_dir: Path) -> dict[str, Any]:
         state_path = run_dir / "state.json"
         if not state_path.exists():
-            return {"tags": [], "archived": False, "retention": {}}
+            return {
+                "tags": [],
+                "archived": False,
+                "retention": {},
+                "notes": "",
+            }
         try:
             raw = json.loads(state_path.read_text())
         except json.JSONDecodeError:
-            return {"tags": [], "archived": False, "retention": {}}
+            return {
+                "tags": [],
+                "archived": False,
+                "retention": {},
+                "notes": "",
+            }
         return {
             "tags": list(raw.get("tags") or []),
             "archived": bool(raw.get("archived", False)),
             "retention": dict(raw.get("retention") or {}),
+            "notes": str(raw.get("notes") or ""),
         }
 
     # ----- state (tags / archived) -----
@@ -288,6 +299,14 @@ class Storage:
             if "max_age_days" in r:
                 normalized["max_age_days"] = max(0.0, float(r["max_age_days"]))
             state["retention"] = normalized
+        if "notes" in patch:
+            notes = patch["notes"]
+            if not isinstance(notes, str):
+                raise InvalidName("notes must be a string")
+            # Cap to avoid unbounded growth.
+            if len(notes) > 100_000:
+                raise InvalidName("notes too long (max 100 000 chars)")
+            state["notes"] = notes
         (run_dir / "state.json").write_text(
             json.dumps(state, indent=2, sort_keys=True)
         )
