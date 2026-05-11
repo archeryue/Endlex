@@ -240,6 +240,39 @@ def test_dashboard_compare_button_navigates(live_server, tmp_path: Path, page: P
     expect(page).to_have_url(re.compile(r"/compare\?runs="))
 
 
+def test_static_export_renders_offline_charts(
+    live_server, tmp_path: Path, page: Page
+):
+    """The static export page renders charts from embedded data — no fetch()."""
+    url, _ = live_server
+    _seed(url, tmp_path, name="exp")
+
+    # Save the HTML locally and load it via file:// to prove it's self-contained.
+    import httpx
+    out = tmp_path / "report.html"
+    with httpx.Client(base_url=url) as c:
+        r = c.get("/api/runs/exp/export.html")
+        assert r.status_code == 200
+        out.write_text(r.text)
+
+    page.goto(out.as_uri())
+    expect(page).to_have_title(re.compile(r"exp.*Endlex"))
+    canvases = page.locator("#charts canvas")
+    # Wait for Chart.js to load + render.
+    canvases.first.wait_for(state="visible", timeout=10_000)
+    assert canvases.count() >= 4
+    has_pixels = page.evaluate(
+        """() => {
+          const c = document.querySelector('#charts canvas');
+          if (!c) return false;
+          const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+          for (let i = 3; i < d.length; i += 4) if (d[i] > 0) return true;
+          return false;
+        }"""
+    )
+    assert has_pixels
+
+
 def test_run_page_upgrades_to_sse(live_server, tmp_path: Path, page: Page):
     """After the initial bulk poll, the page upgrades to an EventSource and
     the status text picks up the (live) suffix."""

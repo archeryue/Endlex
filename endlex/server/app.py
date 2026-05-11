@@ -280,6 +280,40 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 — long but flat
         path = storage.checkpoint_file_path(name, step, filename)
         return FileResponse(path, filename=filename)
 
+    @app.get(
+        "/api/runs/{name}/export.html",
+        response_class=HTMLResponse,
+        dependencies=[Depends(require_read_auth)],
+    )
+    async def export_run(
+        request: Request,
+        name: str,
+        storage: StorageDep,
+        download: bool = Query(default=False),
+    ):
+        if not storage.run_exists(name):
+            raise RunNotFound(name)
+        events, _ = storage.read_metrics(name)
+        import datetime as _dt
+
+        response = _templates_of(request).TemplateResponse(
+            request,
+            "export.html",
+            {
+                "name": name,
+                "config": storage.get_config(name),
+                "summary": asdict(storage.summarize_run(name)),
+                "checkpoints": storage.list_checkpoints(name),
+                "events": events,
+                "generated_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            },
+        )
+        if download:
+            response.headers["Content-Disposition"] = (
+                f'attachment; filename="endlex-{name}.html"'
+            )
+        return response
+
     # ---------- reads (HTML) ----------
 
     @app.get(

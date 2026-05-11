@@ -25,12 +25,25 @@ deploy/                 # systemd unit, nginx snippet, env.example
 
 ```bash
 uv sync --extra server          # install deps incl. fastapi/uvicorn
-uv run pytest -q                # full suite (~1s, includes a live uvicorn e2e)
+uv run pytest -q                # full suite (~8s; includes uvicorn e2e + Chromium UI)
 uv run pytest tests/test_tracker.py::test_log_hot_path_under_100us  # perf gate
+uv run playwright install chromium  # one-time: required for tests/test_browser.py
 uv run endlex-server            # run the server (port 8000 by default)
 ```
 
 The cloud trainer should `pip install endlex` (no `--extra server`) — the client deps are just `httpx`.
+
+## Features beyond v1
+
+These are landed and tested; treat them as the authoritative behavior rather than re-reading TECH_PLAN for them:
+
+- **Run state**: `runs/<name>/state.json` holds `{tags, archived, retention}`. `PATCH /api/runs/<name>/state` is the write surface; dashboard surfaces tag chips and an archived chip.
+- **Compare overlay**: `/compare?runs=a,b,c` overlays multiple runs on the standard panels. Dashboard has row checkboxes + "Compare selected" button.
+- **Checkpoint retention**: env defaults `ENDLEX_CKPT_KEEP_LAST` / `ENDLEX_CKPT_MAX_AGE_DAYS`, per-run override via state.json `retention`. Prune happens after each upload + on `POST /api/admin/prune`.
+- **Search/filter**: dashboard search box grammar — substring | `tag:foo` | `key<op>num` (key on the latest metric event; ops `<`, `<=`, `>`, `>=`, `=`). Space-separated terms AND together.
+- **Live updates**: `GET /api/runs/<name>/metrics/stream` is an SSE endpoint emitting `event: metric` per new event. Run + compare pages upgrade to EventSource after the initial poll and fall back to 5s polling on error.
+- **Static export**: `GET /api/runs/<name>/export.html` returns a self-contained HTML report with all metrics embedded as JSON and the same chart panels (Chart.js from CDN). Append `?download=1` for `Content-Disposition: attachment`.
+- **Write auth in the browser**: `_base.html` exposes `endlex.authedFetch(url, opts)` which lazy-prompts for `ENDLEX_TOKEN`, caches it in `localStorage`, and clears on 401/403.
 
 ## What Endlex is
 

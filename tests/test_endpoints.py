@@ -299,3 +299,39 @@ def test_admin_prune_requires_auth(client):
 
 # SSE stream tests live in test_e2e.py — TestClient buffers ASGI
 # streaming responses too eagerly to assert on event timing.
+
+
+# ---------- static export ----------
+
+def test_export_html_embeds_metrics(client):
+    _init(client, "r", {"lr": 1e-4})
+    client.post(
+        "/api/runs/r/metrics",
+        json=[{"step": 1, "train/loss": 2.0}, {"step": 2, "train/loss": 1.5}],
+        headers=AUTH,
+    )
+    r = client.get("/api/runs/r/export.html")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/html")
+    # Static (no live polling).
+    assert "/api/runs/r/metrics" not in r.text  # no fetch URL embedded
+    assert "EventSource" not in r.text
+    # Metrics are embedded as JSON; both events should appear.
+    assert "endlex-data" in r.text
+    assert '"step":1' in r.text or '"step": 1' in r.text
+    assert '"step":2' in r.text or '"step": 2' in r.text
+    # No "Content-Disposition: attachment" unless ?download=1
+    assert "attachment" not in r.headers.get("content-disposition", "")
+
+
+def test_export_html_download_param_sets_disposition(client):
+    _init(client, "r")
+    r = client.get("/api/runs/r/export.html?download=true")
+    assert r.status_code == 200
+    assert r.headers["content-disposition"].startswith("attachment")
+    assert 'filename="endlex-r.html"' in r.headers["content-disposition"]
+
+
+def test_export_html_404_for_missing_run(client):
+    r = client.get("/api/runs/ghost/export.html")
+    assert r.status_code == 404
