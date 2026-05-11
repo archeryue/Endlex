@@ -128,3 +128,8 @@ def test_checkpoint_rejects_path_traversal(store: Storage):
         store.write_checkpoint_file("r", 1000, "../escape", io.BytesIO(b"x"))
     with pytest.raises(InvalidName):
         store.checkpoint_file_path("r", 1000, "../escape")
+
+
+def test_checkpoint_requires_existing_run(store: Storage):
+    with pytest.raises(RunNotFound):
+        store.write_checkpoint_file("ghost", 1000, "model.pt", io.BytesIO(b"x"))

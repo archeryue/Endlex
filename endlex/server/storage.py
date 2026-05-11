@@ -223,6 +223,8 @@ class Storage:
         _validate_name(name)
         _validate_step(str(step))
         _validate_filename(filename)
+        if not (self.runs_dir / name).is_dir():
+            raise RunNotFound(name)
         d = self.ckpt_dir / name / _step_dirname(step)
         d.mkdir(parents=True, exist_ok=True)
         return d / filename
