@@ -146,6 +146,68 @@ def test_dashboard_filters_archived(live_server, tmp_path: Path, page: Page):
     expect(archived_row.locator(".chip", has_text="wip")).to_be_visible()
 
 
+def test_dashboard_search_filter(live_server, tmp_path: Path, page: Page):
+    """Exercise the filter grammar end-to-end."""
+    url, _ = live_server
+    # Seed three runs with distinct metric ranges.
+    import httpx
+
+    from endlex import Tracker
+
+    def seed_with_loss(name: str, loss: float, tags: list[str]):
+        t = Tracker(
+            project="proj",
+            name=name,
+            config={},
+            local_dir=tmp_path / f"local-{name}",
+            url=url,
+            token="e2e-tok",
+            batch_size=1,
+            batch_interval=0.05,
+        )
+        try:
+            t.log({"step": 0, "train/loss": loss, "val/bpb": loss / 5.0})
+        finally:
+            t.finish(timeout=5)
+        with httpx.Client(base_url=url) as c:
+            r = c.patch(
+                f"/api/runs/{name}/state",
+                json={"tags": tags},
+                headers={"Authorization": "Bearer e2e-tok"},
+            )
+            assert r.status_code == 200
+
+    seed_with_loss("alpha-good", 0.5, ["best"])
+    seed_with_loss("alpha-mid", 2.0, ["wip"])
+    seed_with_loss("beta-bad", 5.0, ["wip"])
+
+    page.goto(url)
+    expect(page.locator("tbody tr:visible")).to_have_count(3)
+
+    # 1. Substring match.
+    page.locator("#search").fill("alpha")
+    expect(page.locator("tbody tr:visible")).to_have_count(2)
+
+    # 2. Tag filter.
+    page.locator("#search").fill("tag:best")
+    expect(page.locator("tbody tr:visible")).to_have_count(1)
+    expect(page.locator("tbody tr:visible").locator("a").first).to_have_text(
+        "alpha-good"
+    )
+
+    # 3. Numeric metric filter.
+    page.locator("#search").fill("train/loss<1.0")
+    expect(page.locator("tbody tr:visible")).to_have_count(1)
+
+    # 4. AND-combined (substring + numeric).
+    page.locator("#search").fill("alpha train/loss<1.0")
+    expect(page.locator("tbody tr:visible")).to_have_count(1)
+
+    # 5. Clear filter → all back.
+    page.locator("#search").fill("")
+    expect(page.locator("tbody tr:visible")).to_have_count(3)
+
+
 def test_compare_view_overlays_runs(live_server, tmp_path: Path, page: Page):
     url, _ = live_server
     _seed(url, tmp_path, name="alpha")
