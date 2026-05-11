@@ -68,6 +68,7 @@ class Tracker:
         self._failed_requests = 0
         self._last_error: str | None = None
         self._resynced = 0
+        self._in_flight = 0  # events popped from queue but not yet POST'd
 
         root = Path(
             local_dir
@@ -143,6 +144,23 @@ class Tracker:
 
     # ---------- lifecycle ----------
 
+    def flush(self, *, timeout: float = 10.0) -> bool:
+        """Block until the outbound queue is empty and no batch is in flight.
+
+        Useful between epochs or before a checkpoint upload so the dashboard
+        is current. Offline mode (no URL) is a no-op that returns True.
+        Returns True if drained, False if the timeout elapsed first.
+        """
+        if self._thread is None:
+            return True
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not self._queue and self._in_flight == 0:
+                return True
+            self._wake.set()
+            time.sleep(0.01)
+        return not self._queue and self._in_flight == 0
+
     def finish(self, *, timeout: float = 30.0) -> None:
         if self._finished:
             return
@@ -157,6 +175,28 @@ class Tracker:
             self._local.close()
         except Exception:
             pass
+        # Surface any way the remote diverged from local — easy to miss
+        # otherwise, since the trainer's hot path swallows all of this.
+        warnings: list[str] = []
+        if self._dropped > 0:
+            warnings.append(
+                f"{self._dropped} events dropped from remote queue "
+                "(local JSONL still has them)"
+            )
+        if self._failed_requests > 0:
+            warnings.append(
+                f"{self._failed_requests} failed HTTP attempts "
+                f"(last error: {self._last_error})"
+            )
+        if warnings:
+            import sys
+
+            print(
+                f"[endlex] Tracker '{self.name}' finished with notable conditions:",
+                file=sys.stderr,
+            )
+            for w in warnings:
+                print(f"  - {w}", file=sys.stderr)
 
     def __enter__(self) -> "Tracker":
         return self
@@ -306,13 +346,23 @@ class Tracker:
 
     def _drain_one_batch(self) -> None:
         batch = self._take_batch()
-        if batch:
+        if not batch:
+            return
+        self._in_flight = len(batch)
+        try:
             self._post_batch(batch)
+        finally:
+            self._in_flight = 0
 
     def _drain_all(self) -> None:
         while True:
             batch = self._take_batch()
             if not batch:
                 return
-            if not self._post_batch(batch):
+            self._in_flight = len(batch)
+            try:
+                ok = self._post_batch(batch)
+            finally:
+                self._in_flight = 0
+            if not ok:
                 return

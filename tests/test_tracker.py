@@ -27,12 +27,12 @@ def _make_tracker(
         app = create_app(server_data)
         tc = TestClient(app)
         tc.headers["Authorization"] = "Bearer tok"
+        kwargs.setdefault("batch_interval", 0.05)  # fast for tests
         return Tracker(
             project="p",
             name="r",
             config={"lr": 1e-4},
             local_dir=local_dir,
-            batch_interval=0.05,  # fast for tests
             _client=tc,
             **kwargs,
         )
@@ -364,6 +364,48 @@ def test_resync_skips_when_server_already_has_events(
     lines = [l for l in server_metrics.read_text().splitlines() if l.strip()]
     assert len(lines) == 3  # no resync happened, count unchanged
     assert t.resynced == 0
+
+
+def test_flush_drains_queue_synchronously(tmp_path: Path, server_data: Path):
+    """flush() should wait until every queued event is on the server."""
+    t = _make_tracker(
+        tmp_path,
+        online=True,
+        server_data=server_data,
+        batch_size=1000,        # huge — count-trigger won't fire
+        batch_interval=10.0,    # huge — time-trigger won't fire during test
+    )
+    for i in range(5):
+        t.log({"step": i})
+    # Without flush, server might still be empty — daemon hasn't woken.
+    assert t.flush(timeout=5) is True
+    server_metrics = server_data / "runs" / "r" / "metrics.jsonl"
+    lines = server_metrics.read_text().splitlines()
+    assert len(lines) == 5
+    t.finish(timeout=5)
+
+
+def test_flush_offline_mode_is_noop(tmp_path: Path):
+    t = _make_tracker(tmp_path, online=False)
+    assert t.flush(timeout=1) is True
+    t.finish()
+
+
+def test_finish_warns_on_failed_requests(tmp_path: Path, capsys):
+    handler, _ = _mock_handler_factory([503, 503, 503, 503])  # all fail
+    t = _make_tracker_with_handler(tmp_path, handler)
+    t.log({"step": 1})
+    t.finish(timeout=5)
+    err = capsys.readouterr().err
+    assert "Tracker 'n' finished with notable conditions" in err
+    assert "failed HTTP attempts" in err
+
+
+def test_finish_no_warn_when_clean(tmp_path: Path, server_data: Path, capsys):
+    t = _make_tracker(tmp_path, online=True, server_data=server_data)
+    t.log({"step": 1})
+    t.finish(timeout=5)
+    assert "notable conditions" not in capsys.readouterr().err
 
 
 def test_retry_does_not_run_on_trainer_thread(tmp_path: Path):
