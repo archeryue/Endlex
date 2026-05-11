@@ -187,15 +187,23 @@ def test_missing_project_or_name_raises(tmp_path: Path):
 def _mock_handler_factory(behaviors: list, *, init_ok: bool = True):
     """`behaviors` is a list of HTTP status codes (or callables) for /metrics POSTs.
     Each call to /metrics POPs the next behavior. /init always returns 200 unless
-    init_ok=False (returns 503).
+    init_ok=False (returns 503). GET /api/runs/<name> (resync probe) always returns
+    a clean summary with 0 events so resync never gets in the way.
     """
-    state = {"metrics_calls": 0, "init_calls": 0}
+    state = {"metrics_calls": 0, "init_calls": 0, "get_calls": 0}
 
     def handler(request):
-        if "/init" in request.url.path:
+        path = request.url.path
+        method = request.method
+        if method == "POST" and "/init" in path:
             state["init_calls"] += 1
             return httpx.Response(200 if init_ok else 503)
-        if "/metrics" in request.url.path:
+        if method == "GET" and path.startswith("/api/runs/"):
+            state["get_calls"] += 1
+            return httpx.Response(
+                200, json={"summary": {"num_events": 0}}
+            )
+        if method == "POST" and "/metrics" in path:
             i = state["metrics_calls"]
             state["metrics_calls"] += 1
             spec = behaviors[i] if i < len(behaviors) else behaviors[-1]
@@ -260,22 +268,102 @@ def test_post_4xx_does_not_retry(tmp_path: Path):
 
 def test_post_retries_on_transport_error(tmp_path: Path):
     """Transport-level errors (connection refused, etc.) also trigger retry."""
-    calls = {"n": 0}
 
-    def handler(request):
-        if "/init" in request.url.path:
-            return httpx.Response(200)
-        calls["n"] += 1
-        if calls["n"] < 2:
+    def first_call_raises(request):
+        if not getattr(first_call_raises, "fired", False):
+            first_call_raises.fired = True
             raise httpx.ConnectError("simulated network blip")
         return httpx.Response(200, json={"appended": 1})
 
+    handler, state = _mock_handler_factory([first_call_raises])
     t = _make_tracker_with_handler(tmp_path, handler)
     t.log({"step": 1})
     t.finish(timeout=5)
-    assert calls["n"] == 2
+    assert state["metrics_calls"] == 2
     assert t.failed_requests == 1
     assert "ConnectError" in (t.last_error or "")
+
+
+def test_resync_ships_local_events_server_doesnt_have(
+    tmp_path: Path, server_data: Path
+):
+    """Simulate cloud-restart-after-outage: local JSONL has events that the
+    server doesn't, then a fresh Tracker boots and should ship the gap."""
+    local_dir = tmp_path / "local"
+    run_dir = local_dir / "p" / "r"
+    run_dir.mkdir(parents=True)
+    (run_dir / "metrics.jsonl").write_text(
+        "\n".join(
+            json.dumps({"step": i, "train/loss": float(i)})
+            for i in range(10)
+        )
+        + "\n"
+    )
+
+    app = create_app(server_data)
+    tc = TestClient(app)
+    tc.headers["Authorization"] = "Bearer tok"
+
+    t = Tracker(
+        project="p",
+        name="r",
+        config={"lr": 1e-4},
+        local_dir=local_dir,
+        batch_size=5,
+        batch_interval=0.05,
+        retry_delays=(),
+        _client=tc,
+    )
+    # No new .log() — only the resync ships the pre-existing 10 events.
+    t.finish(timeout=10)
+
+    server_metrics = server_data / "runs" / "r" / "metrics.jsonl"
+    lines = [json.loads(l) for l in server_metrics.read_text().splitlines() if l.strip()]
+    assert len(lines) == 10
+    assert [e["step"] for e in lines] == list(range(10))
+    assert t.resynced == 10
+
+
+def test_resync_skips_when_server_already_has_events(
+    tmp_path: Path, server_data: Path
+):
+    """If the server is ahead of local (shouldn't happen for a single writer,
+    but be defensive), resync is a no-op."""
+    # Pre-populate the server with events.
+    app = create_app(server_data)
+    tc = TestClient(app)
+    tc.headers["Authorization"] = "Bearer tok"
+    tc.post("/api/runs/r/init", json={})
+    tc.post(
+        "/api/runs/r/metrics",
+        json=[{"step": 0}, {"step": 1}, {"step": 2}],
+    )
+
+    # Local has the SAME number of events.
+    local_dir = tmp_path / "local"
+    run_dir = local_dir / "p" / "r"
+    run_dir.mkdir(parents=True)
+    (run_dir / "metrics.jsonl").write_text(
+        "\n".join(json.dumps({"step": i}) for i in range(3)) + "\n"
+    )
+
+    t = Tracker(
+        project="p",
+        name="r",
+        config={},
+        local_dir=local_dir,
+        batch_size=5,
+        batch_interval=0.05,
+        retry_delays=(),
+        force=True,
+        _client=tc,
+    )
+    t.finish(timeout=5)
+
+    server_metrics = server_data / "runs" / "r" / "metrics.jsonl"
+    lines = [l for l in server_metrics.read_text().splitlines() if l.strip()]
+    assert len(lines) == 3  # no resync happened, count unchanged
+    assert t.resynced == 0
 
 
 def test_retry_does_not_run_on_trainer_thread(tmp_path: Path):

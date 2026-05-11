@@ -67,6 +67,7 @@ class Tracker:
         self._dropped = 0
         self._failed_requests = 0
         self._last_error: str | None = None
+        self._resynced = 0
 
         root = Path(
             local_dir
@@ -78,12 +79,24 @@ class Tracker:
         (self._dir / "config.json").write_text(
             json.dumps(self.config, indent=2, sort_keys=True)
         )
+
+        # Snapshot the local JSONL line count BEFORE we open it for append.
+        # Anything beyond this index is "this session" and flows through the
+        # queue; the resync path ships only these pre-existing lines so it
+        # can't accidentally duplicate the events we're about to log.
+        metrics_path = self._dir / "metrics.jsonl"
+        self._initial_local_count = 0
+        if metrics_path.exists():
+            try:
+                with metrics_path.open("rb") as f:
+                    self._initial_local_count = sum(1 for ln in f if ln.strip())
+            except OSError:
+                pass
+
         # Line-buffered: each newline-terminated write hits the OS, so `kill -9`
         # of the trainer loses zero data (only an in-flight kernel buffer
         # crash on the host could).
-        self._local = open(
-            self._dir / "metrics.jsonl", "a", buffering=1, encoding="utf-8"
-        )
+        self._local = open(metrics_path, "a", buffering=1, encoding="utf-8")
 
         self._wake = threading.Event()
         self._stop = threading.Event()
@@ -166,17 +179,75 @@ class Tracker:
         """Last observed error string, or None if no requests have failed."""
         return self._last_error
 
+    @property
+    def resynced(self) -> int:
+        """Number of events shipped from local JSONL on startup resync."""
+        return self._resynced
+
     # ---------- daemon ----------
 
     def _loop(self) -> None:
         if not self._init_remote():
             return  # remote is dead; local file keeps recording
         self._init_ok = True
+        self._resynced = self._resync_local_to_remote()
         while not self._stop.is_set():
             self._wake.wait(timeout=self.batch_interval)
             self._wake.clear()
             self._drain_one_batch()
         self._drain_all()
+
+    def _resync_local_to_remote(self) -> int:
+        """Ship pre-existing local events that the server doesn't have yet.
+
+        Use case: a cloud trainer that lost its network mid-run, kept logging
+        locally, and is now resuming. The local file has events past the
+        server's last-known offset.
+
+        Scope is restricted to events that were already in the local file
+        when the Tracker was constructed (``self._initial_local_count``).
+        Events logged during *this* session flow through the queue only —
+        otherwise resync and queue-drain would both ship them and produce
+        duplicates.
+        """
+        n_initial = self._initial_local_count
+        if n_initial == 0:
+            return 0
+        local_path = self._dir / "metrics.jsonl"
+        try:
+            lines: list[bytes] = []
+            with local_path.open("rb") as f:
+                for ln in f:
+                    if ln.strip():
+                        lines.append(ln)
+                    if len(lines) >= n_initial:
+                        break
+        except OSError:
+            return 0
+        if not lines:
+            return 0
+        try:
+            r = self._client.get(f"/api/runs/{self.name}")
+            if r.status_code != 200:
+                return 0
+            server_count = int(r.json().get("summary", {}).get("num_events", 0))
+        except (httpx.HTTPError, ValueError, KeyError, TypeError):
+            return 0
+        if len(lines) <= server_count:
+            return 0
+        to_ship: list[dict[str, Any]] = []
+        for raw in lines[server_count:]:
+            try:
+                to_ship.append(json.loads(raw))
+            except json.JSONDecodeError:
+                continue
+        shipped = 0
+        for i in range(0, len(to_ship), self.batch_size):
+            chunk = to_ship[i : i + self.batch_size]
+            if not self._post_batch(chunk):
+                break
+            shipped += len(chunk)
+        return shipped
 
     def _request_with_retry(
         self, fn: Callable[[], httpx.Response]
