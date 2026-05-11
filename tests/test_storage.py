@@ -146,7 +146,54 @@ def test_get_state_defaults(store: Storage):
         "archived": False,
         "retention": {},
         "notes": "",
+        "project": "",
+        "panels": [],
     }
+
+
+def test_update_state_persists_project(store: Storage):
+    store.init_run("r", {})
+    store.update_state("r", {"project": "archerchat"})
+    assert store.get_state("r")["project"] == "archerchat"
+    assert store.summarize_run("r").project == "archerchat"
+
+
+def test_update_state_rejects_non_string_project(store: Storage):
+    store.init_run("r", {})
+    with pytest.raises(InvalidName):
+        store.update_state("r", {"project": 7})
+
+
+def test_update_state_persists_panels(store: Storage):
+    store.init_run("r", {})
+    store.update_state(
+        "r",
+        {
+            "panels": [
+                {"title": "loss", "x": "step", "y": "train/loss"},
+                {"title": "custom", "x": "step", "y": "train/grad_norm"},
+            ]
+        },
+    )
+    panels = store.get_state("r")["panels"]
+    assert len(panels) == 2
+    assert panels[1] == {"title": "custom", "x": "step", "y": "train/grad_norm"}
+
+
+@pytest.mark.parametrize(
+    "bad_panel",
+    [
+        [{"title": "ok"}],                                    # missing x/y
+        [{"title": "", "x": "step", "y": "loss"}],            # empty title
+        [{"title": "ok", "x": "step", "y": 5}],               # non-string y
+        ["not-a-dict"],
+        "not-a-list",
+    ],
+)
+def test_update_state_rejects_bad_panels(store: Storage, bad_panel):
+    store.init_run("r", {})
+    with pytest.raises(InvalidName):
+        store.update_state("r", {"panels": bad_panel})
 
 
 def test_update_state_persists_notes(store: Storage):

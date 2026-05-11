@@ -122,9 +122,12 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 — long but flat
         config: dict[str, Any],
         storage: StorageDep,
         force: bool = Query(default=False),
+        project: str = Query(default=""),
     ):
         storage.init_run(name, config, force=force)
-        return {"name": name, "config": config}
+        if project:
+            storage.update_state(name, {"project": project})
+        return {"name": name, "config": config, "project": project or None}
 
     @app.post(
         "/api/runs/{name}/metrics",

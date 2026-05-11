@@ -317,7 +317,9 @@ class Tracker:
         return None
 
     def _init_remote(self) -> bool:
-        params = {"force": "true"} if self._force else None
+        params: dict[str, str] = {"project": self.project}
+        if self._force:
+            params["force"] = "true"
         r = self._request_with_retry(
             lambda: self._client.post(
                 f"/api/runs/{self.name}/init",

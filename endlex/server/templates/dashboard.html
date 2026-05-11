@@ -13,7 +13,7 @@
   <input
     type="search"
     id="search"
-    placeholder='filter: substring, tag:best, val/bpb&lt;0.8 (space = AND)'
+    placeholder='filter: substring, project:foo, tag:best, val/bpb&lt;0.8 (space = AND)'
     autocomplete="off"
     style="flex: 1; min-width: 16rem;"
   />
@@ -24,6 +24,7 @@
   <thead>
     <tr>
       <th style="width:1.5rem;"><input type="checkbox" id="check-all" title="select all visible" /></th>
+      <th class="sortable" data-key="project">Project <span class="arrow"></span></th>
       <th class="sortable" data-key="name">Name <span class="arrow"></span></th>
       <th>Tags</th>
       <th class="sortable desc" data-key="last_updated">Last updated <span class="arrow"></span></th>
@@ -37,6 +38,7 @@
     {% for run in runs %}
     <tr
       data-name="{{ run.name }}"
+      data-project="{{ run.project }}"
       data-archived="{{ '1' if run.archived else '0' }}"
       data-tags="{{ run.tags | tojson | forceescape }}"
       data-latest="{{ (run.latest or {}) | tojson | forceescape }}"
@@ -47,6 +49,7 @@
       data-val_bpb="{% if run.latest and run.latest['val/bpb'] is defined %}{{ run.latest['val/bpb'] }}{% else %}{% endif %}"
     >
       <td><input type="checkbox" class="row-check" data-name="{{ run.name }}" /></td>
+      <td>{% if run.project %}<a href="#" class="project-link" data-project="{{ run.project }}">{{ run.project }}</a>{% else %}<span class="muted">&mdash;</span>{% endif %}</td>
       <td>
         <a href="/run/{{ run.name }}">{{ run.name }}</a>
         {% if run.archived %}<span class="chip archived" title="archived">archived</span>{% endif %}
@@ -127,10 +130,13 @@
     return query.trim().split(/\s+/).filter(Boolean);
   }
 
-  function matchTerm(term, name, tags, latest) {
+  function matchTerm(term, name, project, tags, latest) {
     // tag:foo
     const tag = term.match(/^tag:(.+)$/i);
     if (tag) return tags.has(tag[1].toLowerCase());
+    // project:foo
+    const proj = term.match(/^project:(.+)$/i);
+    if (proj) return project === proj[1].toLowerCase();
     // key<value, key<=value, key>=value, key>value, key=value
     const expr = term.match(/^([\w./:_\-]+)\s*(<=|>=|<|>|=)\s*(-?\d+(?:\.\d+)?)\s*$/);
     if (expr) {
@@ -157,11 +163,12 @@
     if (!showArch && r.dataset.archived === "1") return false;
     if (!terms.length) return true;
     const name = r.dataset.name.toLowerCase();
+    const project = (r.dataset.project || "").toLowerCase();
     const tags = new Set(
       JSON.parse(r.dataset.tags || "[]").map(t => t.toLowerCase())
     );
     const latest = JSON.parse(r.dataset.latest || "{}");
-    return terms.every(t => matchTerm(t, name, tags, latest));
+    return terms.every(t => matchTerm(t, name, project, tags, latest));
   }
 
   function applyFilters() {
@@ -179,8 +186,21 @@
       : `${visible} / ${total} runs`;
   }
 
+  // Pre-fill from ?q=... so external links can pre-filter the dashboard.
+  const qParam = new URLSearchParams(location.search).get("q");
+  if (qParam) searchEl.value = qParam;
+
   showArchived.addEventListener("change", applyFilters);
   searchEl.addEventListener("input", applyFilters);
+  // Click a project name → narrow the filter to that project.
+  tbody.addEventListener("click", e => {
+    const link = e.target.closest("a.project-link");
+    if (!link) return;
+    e.preventDefault();
+    searchEl.value = `project:${link.dataset.project}`;
+    applyFilters();
+    searchEl.focus();
+  });
   applyFilters();
 
   // Compare-selected button

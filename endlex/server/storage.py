@@ -49,6 +49,7 @@ class RunSummary:
     latest: dict[str, Any] | None
     tags: list[str]
     archived: bool
+    project: str
 
 
 _DEFAULT_STATE: dict[str, Any] = {"tags": [], "archived": False, "retention": {}}
@@ -225,6 +226,7 @@ class Storage:
                     latest=cache.get("latest"),
                     tags=list(state["tags"]),
                     archived=bool(state["archived"]),
+                    project=str(state.get("project") or ""),
                 )
 
         # Slow path: scan the JSONL and repopulate the cache for next time.
@@ -263,6 +265,7 @@ class Storage:
             latest=latest,
             tags=list(state["tags"]),
             archived=bool(state["archived"]),
+            project=str(state.get("project") or ""),
         )
 
     # ----- summary cache -----
@@ -329,27 +332,27 @@ class Storage:
     @staticmethod
     def _read_state(run_dir: Path) -> dict[str, Any]:
         state_path = run_dir / "state.json"
+        empty: dict[str, Any] = {
+            "tags": [],
+            "archived": False,
+            "retention": {},
+            "notes": "",
+            "project": "",
+            "panels": [],
+        }
         if not state_path.exists():
-            return {
-                "tags": [],
-                "archived": False,
-                "retention": {},
-                "notes": "",
-            }
+            return dict(empty)
         try:
             raw = json.loads(state_path.read_text())
         except json.JSONDecodeError:
-            return {
-                "tags": [],
-                "archived": False,
-                "retention": {},
-                "notes": "",
-            }
+            return dict(empty)
         return {
             "tags": list(raw.get("tags") or []),
             "archived": bool(raw.get("archived", False)),
             "retention": dict(raw.get("retention") or {}),
             "notes": str(raw.get("notes") or ""),
+            "project": str(raw.get("project") or ""),
+            "panels": list(raw.get("panels") or []),
         }
 
     # ----- state (tags / archived) -----
@@ -402,6 +405,30 @@ class Storage:
             if len(notes) > 100_000:
                 raise InvalidName("notes too long (max 100 000 chars)")
             state["notes"] = notes
+        if "project" in patch:
+            project = patch["project"]
+            if not isinstance(project, str):
+                raise InvalidName("project must be a string")
+            if len(project) > 128:
+                raise InvalidName("project name too long (max 128 chars)")
+            state["project"] = project.strip()
+        if "panels" in patch:
+            panels = patch["panels"]
+            if not isinstance(panels, list):
+                raise InvalidName("panels must be a list")
+            normalized_panels: list[dict[str, str]] = []
+            for p in panels:
+                if not isinstance(p, dict):
+                    raise InvalidName("each panel must be an object")
+                for key in ("title", "x", "y"):
+                    if key not in p or not isinstance(p[key], str) or not p[key].strip():
+                        raise InvalidName(
+                            f"panel missing non-empty string field: {key}"
+                        )
+                normalized_panels.append(
+                    {"title": p["title"], "x": p["x"], "y": p["y"]}
+                )
+            state["panels"] = normalized_panels
         (run_dir / "state.json").write_text(
             json.dumps(state, indent=2, sort_keys=True)
         )

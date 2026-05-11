@@ -297,6 +297,32 @@ def test_admin_prune_requires_auth(client):
     assert r.status_code == 401
 
 
+# ---------- project metadata ----------
+
+def test_init_with_project_query_param(client):
+    r = client.post(
+        "/api/runs/r/init?project=archerchat",
+        json={"lr": 1e-4},
+        headers=AUTH,
+    )
+    assert r.status_code == 200
+    assert r.json()["project"] == "archerchat"
+    info = client.get("/api/runs/r").json()
+    assert info["summary"]["project"] == "archerchat"
+
+
+def test_dashboard_renders_project_column(client):
+    client.post(
+        "/api/runs/r/init?project=archerchat",
+        json={},
+        headers=AUTH,
+    )
+    r = client.get("/")
+    assert r.status_code == 200
+    assert "archerchat" in r.text
+    assert "Project" in r.text  # column header
+
+
 # SSE stream tests live in test_e2e.py — TestClient buffers ASGI
 # streaming responses too eagerly to assert on event timing.
 

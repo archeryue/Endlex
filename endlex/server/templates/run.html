@@ -11,7 +11,7 @@
 {% endblock %}
 {% block body %}
 <h1>
-  {{ name }}
+  {% if summary.project %}<a href="/?q=project:{{ summary.project }}" style="color: var(--muted); font-size: .9rem; text-decoration: none;">{{ summary.project }}</a> <span class="muted">/</span> {% endif %}{{ name }}
   <span class="muted" style="font-weight:400;font-size:.9rem;">({{ summary.num_events }} events)</span>
   {% if summary.archived %}<span class="chip archived" style="margin-left:.5rem;vertical-align:middle;">archived</span>{% endif %}
 </h1>
@@ -72,12 +72,18 @@
   </div>
 </details>
 
-<h2>Charts</h2>
+<h2>Charts <button id="btn-reset-panels" style="font-size:.8rem;font-weight:400;margin-left:.5rem;{% if not state.panels %}display:none;{% endif %}">Reset to defaults</button></h2>
 <div id="charts" class="grid"></div>
 <div id="charts-empty" class="empty" style="display:none;">
   <p>Waiting for metrics&hellip;</p>
   <p class="muted">Panels appear automatically when their keys arrive (train/loss, val/bpb, train/mfu, train/dt, train/tok_per_sec, train/lrm).</p>
 </div>
+<datalist id="key-suggestions">
+  <option value="step">
+  <option value="total_training_time">
+  <option value="total_training_flops">
+  {% if summary.latest %}{% for k in summary.latest.keys() %}<option value="{{ k }}">{% endfor %}{% endif %}
+</datalist>
 <p id="status" class="muted" style="margin-top:1rem;font-size:.85rem;">loading&hellip;</p>
 
 <h2>Checkpoints</h2>
@@ -109,8 +115,9 @@
 (() => {
   const RUN = {{ name | tojson }};
 
-  // [title, x-key, y-key]
-  const PANELS = [
+  // Default panel definitions — used when state.panels is empty (the run
+  // hasn't been customized). Format: [title, x-key, y-key].
+  const DEFAULT_PANELS = [
     ["train/loss vs step",          "step", "train/loss"],
     ["val/bpb vs step",             "step", "val/bpb"],
     ["val/bpb vs total_time",       "total_training_time",  "val/bpb"],
@@ -120,13 +127,22 @@
     ["train/tok_per_sec vs step",   "step", "train/tok_per_sec"],
     ["train/lrm vs step",           "step", "train/lrm"],
   ];
+  // state.panels is the user's customization; if empty, defaults are used.
+  const userPanels = {{ state.panels | tojson }};
+  let PANELS = userPanels.length
+    ? userPanels.map(p => [p.title, p.x, p.y])
+    : DEFAULT_PANELS;
 
   const root = document.getElementById("charts");
   const emptyHint = document.getElementById("charts-empty");
   const status = document.getElementById("status");
+  const btnResetPanels = document.getElementById("btn-reset-panels");
   const charts = {};
   let cursor = 0;
   let firstPollDone = false;
+  // Hold on to every event we've ever seen so a panel-add re-renders from
+  // history without re-fetching from the server.
+  const allEvents = [];
 
   const accent =
     getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() ||
@@ -143,8 +159,18 @@
     const [title, xk, yk] = PANELS[idx];
     const wrap = document.createElement("section");
     wrap.className = "panel";
-    wrap.innerHTML = `<h3>${title}</h3><canvas id="chart-${idx}" height="220"></canvas>`;
+    wrap.style.position = "relative";
+    wrap.dataset.panelIdx = String(idx);
+    wrap.innerHTML = `
+      <button class="panel-remove" data-idx="${idx}" title="remove panel"
+              style="position:absolute;top:.45rem;right:.5rem;padding:0 .35rem;line-height:1;background:transparent;border:none;color:var(--muted);cursor:pointer;font-size:1.1rem;">×</button>
+      <h3 style="padding-right:1.25rem;">${title}</h3>
+      <canvas id="chart-${idx}" height="220"></canvas>
+    `;
     root.appendChild(wrap);
+    wrap.querySelector(".panel-remove").addEventListener("click", () =>
+      removePanel(idx)
+    );
     const ctx = wrap.querySelector("canvas").getContext("2d");
     charts[idx] = new Chart(ctx, {
       type: "line",
@@ -181,6 +207,7 @@
 
   function append(events) {
     if (!events.length) return;
+    for (const e of events) allEvents.push(e);
     for (const e of events) {
       PANELS.forEach(([_, xk, yk], idx) => {
         if (e[xk] == null || e[yk] == null) return;
@@ -189,11 +216,97 @@
       });
     }
     Object.values(charts).forEach(c => c.update("none"));
+    ensureAddCard();
   }
 
   function refreshEmptyState() {
     const has = Object.keys(charts).length > 0;
     emptyHint.style.display = has ? "none" : "";
+  }
+
+  // ----- panel editing -----
+  let addCardEl = null;
+  function ensureAddCard() {
+    if (!addCardEl) {
+      addCardEl = document.createElement("section");
+      addCardEl.className = "panel panel-add";
+      addCardEl.style.borderStyle = "dashed";
+      addCardEl.style.display = "flex";
+      addCardEl.style.flexDirection = "column";
+      addCardEl.style.alignItems = "stretch";
+      addCardEl.style.justifyContent = "center";
+      addCardEl.style.gap = ".4rem";
+      addCardEl.innerHTML = `
+        <strong style="font-size:.9rem;color:var(--muted);">Add a panel</strong>
+        <input id="ap-title" placeholder="title (e.g. grad-norm)" autocomplete="off" />
+        <input id="ap-x" list="key-suggestions" placeholder="x key (e.g. step)" autocomplete="off" />
+        <input id="ap-y" list="key-suggestions" placeholder="y key (e.g. train/grad_norm)" autocomplete="off" />
+        <button id="ap-add" class="primary">+ Add panel</button>
+        <span id="ap-status" class="muted" style="font-size:.8rem;"></span>
+      `;
+      root.appendChild(addCardEl);
+      const $ = id => addCardEl.querySelector(`#${id}`);
+      $("ap-add").addEventListener("click", () => addPanel(
+        $("ap-title").value, $("ap-x").value, $("ap-y").value, $("ap-status")
+      ));
+    } else {
+      // Keep the add card at the end after panels.append re-orders elements.
+      root.appendChild(addCardEl);
+    }
+  }
+
+  function effectivePanels() {
+    // What we should persist on the server: if the user has touched the list
+    // at all, send their explicit choices. Otherwise leave it empty so the
+    // run keeps following the defaults if those evolve later.
+    return PANELS.map(([title, x, y]) => ({title, x, y}));
+  }
+
+  async function savePanels(panels) {
+    const r = await endlex.authedFetch(
+      `/api/runs/${encodeURIComponent(RUN)}/state`,
+      {
+        method: "PATCH",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({panels}),
+      }
+    );
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  }
+
+  async function addPanel(title, x, y, statusEl) {
+    title = (title || "").trim(); x = (x || "").trim(); y = (y || "").trim();
+    if (!title || !x || !y) {
+      statusEl.textContent = "title, x, y all required";
+      return;
+    }
+    // If user is still on defaults, materialize them so we can express
+    // additions/removals as a single explicit list.
+    const next = effectivePanels();
+    next.push({title, x, y});
+    try {
+      await savePanels(next);
+      location.reload();
+    } catch (e) { statusEl.textContent = `error: ${e.message}`; }
+  }
+
+  async function removePanel(idx) {
+    const next = effectivePanels();
+    next.splice(idx, 1);
+    try {
+      await savePanels(next);
+      location.reload();
+    } catch (e) { alert(`Remove failed: ${e.message}`); }
+  }
+
+  if (btnResetPanels) {
+    btnResetPanels.addEventListener("click", async () => {
+      if (!confirm("Reset panels to defaults?")) return;
+      try {
+        await savePanels([]);  // empty list → use defaults
+        location.reload();
+      } catch (e) { alert(`Reset failed: ${e.message}`); }
+    });
   }
 
   async function poll() {
@@ -219,6 +332,10 @@
   function stopPolling() {
     if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
   }
+
+  // Render the "Add panel" card immediately so it's available before any
+  // metrics arrive (otherwise it only shows after the first poll).
+  ensureAddCard();
 
   // Initial bulk load via the regular endpoint (fast, one round-trip).
   poll().then(() => {

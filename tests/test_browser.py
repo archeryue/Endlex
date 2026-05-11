@@ -108,11 +108,11 @@ def test_dashboard_lists_runs(live_server, tmp_path: Path, page: Page):
     # Sortable headers: clicking "Name" should sort alphabetically ascending,
     # so the first body row's name link should be "alpha".
     page.locator("th.sortable", has_text="Name").click()
-    first = page.locator("tbody tr").first.locator("a")
-    expect(first).to_have_text("alpha")
+    first_name = page.locator('tbody tr a[href^="/run/"]').first
+    expect(first_name).to_have_text("alpha")
 
     # Clicking the run link navigates to the run page.
-    first.click()
+    first_name.click()
     expect(page).to_have_url(re.compile(r"/run/alpha$"))
 
 
@@ -134,7 +134,7 @@ def test_dashboard_filters_archived(live_server, tmp_path: Path, page: Page):
     # By default, archived rows are hidden.
     visible = page.locator("tbody tr:visible")
     expect(visible).to_have_count(1)
-    expect(visible.first.locator("a")).to_have_text("keep")
+    expect(visible.first.locator('a[href^="/run/"]')).to_have_text("keep")
 
     # Toggle: now both should show.
     page.locator("#show-archived").check()
@@ -191,9 +191,9 @@ def test_dashboard_search_filter(live_server, tmp_path: Path, page: Page):
     # 2. Tag filter.
     page.locator("#search").fill("tag:best")
     expect(page.locator("tbody tr:visible")).to_have_count(1)
-    expect(page.locator("tbody tr:visible").locator("a").first).to_have_text(
-        "alpha-good"
-    )
+    expect(
+        page.locator('tbody tr:visible a[href^="/run/"]').first
+    ).to_have_text("alpha-good")
 
     # 3. Numeric metric filter.
     page.locator("#search").fill("train/loss<1.0")
@@ -322,6 +322,58 @@ def test_tag_chip_editor(live_server, tmp_path: Path, page: Page):
     expect(page.locator("#tags-display .chip")).to_have_count(2)
     expect(page.locator("#tags-display .chip", has_text="best")).to_be_visible()
     expect(page.locator("#tags-display .chip", has_text="exp-1")).to_be_visible()
+
+
+def test_run_page_add_and_remove_custom_panel(
+    live_server, tmp_path: Path, page: Page
+):
+    """User defines a new panel, it persists across reload; removes it via ×."""
+    url, _ = live_server
+    # Seed with a metric that's NOT in the default panel set so the user
+    # has a real reason to add a custom panel.
+    import httpx
+    with httpx.Client(base_url=url) as c:
+        c.post(
+            "/api/runs/r/init", json={}, headers={"Authorization": "Bearer e2e-tok"}
+        )
+        c.post(
+            "/api/runs/r/metrics",
+            json=[
+                {"step": 0, "train/loss": 9.0, "custom/metric": 1.0},
+                {"step": 1, "train/loss": 7.0, "custom/metric": 2.0},
+                {"step": 2, "train/loss": 5.0, "custom/metric": 3.0},
+            ],
+            headers={"Authorization": "Bearer e2e-tok"},
+        )
+
+    page.add_init_script("localStorage.setItem('endlex_token', 'e2e-tok')")
+    page.goto(f"{url}/run/r")
+
+    # Wait for the default `train/loss vs step` panel to materialize.
+    expect(
+        page.locator("#charts .panel", has_text="train/loss vs step")
+    ).to_be_visible(timeout=10_000)
+
+    # The user adds a panel for the non-default `custom/metric` key.
+    page.locator("#ap-title").fill("custom!")
+    page.locator("#ap-x").fill("step")
+    page.locator("#ap-y").fill("custom/metric")
+    page.locator("#ap-add").click()
+
+    # After reload, the custom panel appears (along with the train/loss one).
+    expect(
+        page.locator("#charts .panel", has_text="custom!")
+    ).to_be_visible(timeout=10_000)
+    expect(
+        page.locator("#charts .panel", has_text="train/loss vs step")
+    ).to_be_visible()
+
+    # Remove the custom panel via its × button.
+    custom = page.locator("#charts .panel", has_text="custom!").first
+    custom.locator(".panel-remove").click()
+    expect(
+        page.locator("#charts .panel", has_text="custom!")
+    ).to_have_count(0, timeout=10_000)
 
 
 def test_run_page_notes_edit_persists(live_server, tmp_path: Path, page: Page):
