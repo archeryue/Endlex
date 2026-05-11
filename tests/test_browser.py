@@ -224,6 +224,70 @@ def test_compare_view_overlays_runs(live_server, tmp_path: Path, page: Page):
     page.screenshot(path="/tmp/endlex-compare.png", full_page=True)
 
 
+def test_compare_page_add_and_edit_panel(live_server, tmp_path: Path, page: Page):
+    """Same edit/add UI on the compare page; persistence is localStorage so
+    customizing /compare?runs=alpha,beta doesn't bleed elsewhere."""
+    url, _ = live_server
+    _seed(url, tmp_path, name="alpha")
+    _seed(url, tmp_path, name="beta")
+
+    page.goto(f"{url}/compare?runs=alpha,beta")
+    expect(page).to_have_title(re.compile(r"Compare"))
+
+    # Default panel should materialize (both runs share train/loss).
+    expect(
+        page.locator("#charts .panel", has_text="train/loss vs step")
+    ).to_be_visible(timeout=10_000)
+
+    # The add card starts collapsed.
+    expect(page.locator(".ap-trigger")).to_be_visible()
+    expect(page.locator(".ap-form")).not_to_be_visible()
+    page.locator(".ap-trigger").click()
+    expect(page.locator(".ap-form")).to_be_visible()
+
+    # Try editing the train/loss panel: set xmin=5.
+    loss_panel = page.locator("#charts .panel", has_text="train/loss vs step").first
+    loss_panel.locator(".panel-edit").click()
+    expect(loss_panel.locator(".panel-edit-form")).to_be_visible()
+    loss_panel.locator(".pe-xmin").fill("5")
+    loss_panel.locator(".pe-save").click()
+
+    # After reload, the corresponding Chart.js instance should report x.min=5.
+    page.wait_for_function(
+        """() => {
+          for (const cv of document.querySelectorAll('#charts canvas')) {
+            if (Chart.getChart(cv)) return true;
+          }
+          return false;
+        }""",
+        timeout=10_000,
+    )
+    xmin = page.evaluate(
+        """() => {
+          for (const cv of document.querySelectorAll('#charts canvas')) {
+            const ch = Chart.getChart(cv);
+            if (ch && ch.options.scales.x.min === 5) return 5;
+          }
+          return null;
+        }"""
+    )
+    assert xmin == 5, "no compare-view panel reflected the saved xmin"
+
+    # Reset wipes the localStorage key and goes back to defaults.
+    page.on("dialog", lambda d: d.accept())  # confirm() → OK
+    page.locator("#btn-reset-panels").click()
+    page.wait_for_function(
+        """() => {
+          for (const cv of document.querySelectorAll('#charts canvas')) {
+            const ch = Chart.getChart(cv);
+            if (ch && ch.options.scales.x.min === 5) return false;
+          }
+          return true;
+        }""",
+        timeout=10_000,
+    )
+
+
 def test_dashboard_compare_button_navigates(live_server, tmp_path: Path, page: Page):
     url, _ = live_server
     _seed(url, tmp_path, name="alpha")
