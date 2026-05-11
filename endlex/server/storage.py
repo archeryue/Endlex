@@ -139,8 +139,10 @@ class Storage:
         if not run_dir.is_dir():
             raise RunNotFound(name)
         path = run_dir / "metrics.jsonl"
+        events_list = list(events)
         lines = [
-            json.dumps(e, separators=(",", ":"), sort_keys=True) + "\n" for e in events
+            json.dumps(e, separators=(",", ":"), sort_keys=True) + "\n"
+            for e in events_list
         ]
         if not lines:
             return 0
@@ -154,6 +156,9 @@ class Storage:
             os.write(fd, data)
         finally:
             os.close(fd)
+        # Bump the summary cache so the dashboard's _summarize stays O(1)
+        # per run instead of re-reading the whole JSONL every page load.
+        self._bump_summary_cache(run_dir, events_list, path)
         return len(lines)
 
     def read_metrics(
@@ -201,11 +206,34 @@ class Storage:
         name = run_dir.name
         metrics_path = run_dir / "metrics.jsonl"
         cfg_path = run_dir / "config.json"
+        state = self._read_state(run_dir)
+
+        # Fast path: a .summary.json sidecar whose recorded metrics_size matches
+        # the file on disk is authoritative. Stays in sync with append_metrics;
+        # any external mutation flips the size and triggers a full rescan.
+        if metrics_path.exists():
+            try:
+                actual_size = metrics_path.stat().st_size
+            except OSError:
+                actual_size = -1
+            cache = self._read_summary_cache(run_dir)
+            if cache and cache.get("metrics_size") == actual_size:
+                return RunSummary(
+                    name=name,
+                    last_updated=cache.get("last_updated"),
+                    num_events=int(cache.get("num_events", 0)),
+                    latest=cache.get("latest"),
+                    tags=list(state["tags"]),
+                    archived=bool(state["archived"]),
+                )
+
+        # Slow path: scan the JSONL and repopulate the cache for next time.
         last_updated: float | None = None
         num_events = 0
         latest: dict[str, Any] | None = None
         if metrics_path.exists() and metrics_path.stat().st_size > 0:
-            last_updated = metrics_path.stat().st_mtime
+            stat = metrics_path.stat()
+            last_updated = stat.st_mtime
             with metrics_path.open("rb") as f:
                 last_line: bytes | None = None
                 for raw in f:
@@ -219,9 +247,15 @@ class Storage:
                         latest = json.loads(last_line)
                     except json.JSONDecodeError:
                         latest = None
+            self._write_summary_cache(
+                run_dir,
+                num_events=num_events,
+                latest=latest,
+                last_updated=last_updated,
+                metrics_size=stat.st_size,
+            )
         elif cfg_path.exists():
             last_updated = cfg_path.stat().st_mtime
-        state = self._read_state(run_dir)
         return RunSummary(
             name=name,
             last_updated=last_updated,
@@ -229,6 +263,67 @@ class Storage:
             latest=latest,
             tags=list(state["tags"]),
             archived=bool(state["archived"]),
+        )
+
+    # ----- summary cache -----
+
+    @staticmethod
+    def _read_summary_cache(run_dir: Path) -> dict[str, Any] | None:
+        cache_path = run_dir / ".summary.json"
+        if not cache_path.exists():
+            return None
+        try:
+            return json.loads(cache_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    @staticmethod
+    def _write_summary_cache(
+        run_dir: Path,
+        *,
+        num_events: int,
+        latest: Any,
+        last_updated: float | None,
+        metrics_size: int,
+    ) -> None:
+        cache_path = run_dir / ".summary.json"
+        try:
+            cache_path.write_text(
+                json.dumps(
+                    {
+                        "num_events": num_events,
+                        "latest": latest,
+                        "last_updated": last_updated,
+                        "metrics_size": metrics_size,
+                    }
+                )
+            )
+        except OSError:
+            pass  # cache is best-effort
+
+    def _bump_summary_cache(
+        self,
+        run_dir: Path,
+        events_just_appended: list[dict[str, Any]],
+        metrics_path: Path,
+    ) -> None:
+        current = self._read_summary_cache(run_dir) or {}
+        new_count = int(current.get("num_events", 0)) + len(events_just_appended)
+        new_latest = (
+            events_just_appended[-1]
+            if events_just_appended
+            else current.get("latest")
+        )
+        try:
+            stat = metrics_path.stat()
+        except OSError:
+            return
+        self._write_summary_cache(
+            run_dir,
+            num_events=new_count,
+            latest=new_latest,
+            last_updated=stat.st_mtime,
+            metrics_size=stat.st_size,
         )
 
     @staticmethod

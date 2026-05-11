@@ -167,6 +167,94 @@ def test_update_state_rejects_oversize_notes(store: Storage):
         store.update_state("r", {"notes": "x" * 100_001})
 
 
+# ---------- summary cache ----------
+
+def test_summary_cache_written_on_append(store: Storage):
+    store.init_run("r", {})
+    store.append_metrics("r", [{"step": 1, "loss": 2.0}])
+    cache_path = store.runs_dir / "r" / ".summary.json"
+    assert cache_path.exists()
+    payload = json.loads(cache_path.read_text())
+    assert payload["num_events"] == 1
+    assert payload["latest"] == {"step": 1, "loss": 2.0}
+    assert payload["metrics_size"] > 0
+
+
+def test_summary_cache_increments_on_repeated_append(store: Storage):
+    store.init_run("r", {})
+    store.append_metrics("r", [{"step": 1}, {"step": 2}])
+    store.append_metrics("r", [{"step": 3}])
+    s = store.summarize_run("r")
+    assert s.num_events == 3
+    assert s.latest == {"step": 3}
+
+
+def test_summary_cache_matches_full_scan(store: Storage):
+    """Cached summary must equal the result of a from-scratch scan."""
+    store.init_run("r", {})
+    for i in range(50):
+        store.append_metrics("r", [{"step": i, "loss": float(i)}])
+    cached = store.summarize_run("r")
+    # Invalidate the cache and re-summarize via full scan.
+    (store.runs_dir / "r" / ".summary.json").unlink()
+    scanned = store.summarize_run("r")
+    assert cached.num_events == scanned.num_events == 50
+    assert cached.latest == scanned.latest
+
+
+def test_summary_cache_invalidated_on_external_mutation(store: Storage):
+    """If something writes to metrics.jsonl outside Storage, the size flips
+    and the cached summary must be discarded on next read."""
+    store.init_run("r", {})
+    store.append_metrics("r", [{"step": 0}])
+    # Append externally — no cache bump.
+    metrics = store.runs_dir / "r" / "metrics.jsonl"
+    with metrics.open("ab") as f:
+        f.write(b'{"step":1}\n{"step":2}\n')
+    s = store.summarize_run("r")
+    assert s.num_events == 3  # full rescan caught the extra two
+    assert s.latest == {"step": 2}
+
+
+def test_list_runs_perf_under_cache(tmp_path: Path):
+    """Many runs × many events: list_runs must stay fast under the cache."""
+    s = Storage(tmp_path)
+    N_RUNS = 30
+    N_EVENTS = 5_000  # big enough that the cache makes a clear difference
+    for i in range(N_RUNS):
+        name = f"r{i:03d}"
+        s.init_run(name, {})
+        s.append_metrics(
+            name,
+            [{"step": j, "train/loss": float(j)} for j in range(N_EVENTS)],
+        )
+
+    # Warm: first call may populate caches via _summarize's slow path if any
+    # were missed (shouldn't be — we just appended which bumps the cache).
+    s.list_runs()
+
+    t0 = time.perf_counter()
+    summaries = s.list_runs()
+    cached_dt = time.perf_counter() - t0
+    assert len(summaries) == N_RUNS
+
+    # Drop all caches and time the slow path to make the win observable.
+    for i in range(N_RUNS):
+        cp = s.runs_dir / f"r{i:03d}" / ".summary.json"
+        if cp.exists():
+            cp.unlink()
+    t0 = time.perf_counter()
+    s.list_runs()
+    uncached_dt = time.perf_counter() - t0
+
+    # Cache hit should be at least 5× faster, and absolute under 100ms.
+    assert cached_dt < 0.1, f"cached list_runs took {cached_dt*1000:.1f}ms (>100ms)"
+    assert cached_dt < uncached_dt / 5, (
+        f"cache speedup too small: cached={cached_dt*1000:.1f}ms, "
+        f"uncached={uncached_dt*1000:.1f}ms"
+    )
+
+
 def test_update_state_persists_tags(store: Storage):
     store.init_run("r", {})
     state = store.update_state("r", {"tags": ["foo", "bar"]})
