@@ -294,6 +294,36 @@ def test_run_page_upgrades_to_sse(live_server, tmp_path: Path, page: Page):
     expect(page.locator("#status")).to_contain_text("(live)", timeout=10_000)
 
 
+def test_tag_chip_editor(live_server, tmp_path: Path, page: Page):
+    """The inline chip editor adds tags via Enter, removes via × and Backspace,
+    and persists via the existing PATCH /state endpoint."""
+    url, _ = live_server
+    _seed(url, tmp_path, name="r")
+    page.add_init_script("localStorage.setItem('endlex_token', 'e2e-tok')")
+    page.goto(f"{url}/run/r")
+
+    page.locator("#btn-edit-tags").click()
+    expect(page.locator("#tags-editor")).to_be_visible()
+    # Add two tags via Enter, one via comma.
+    page.locator("#tags-input").fill("best")
+    page.locator("#tags-input").press("Enter")
+    page.locator("#tags-input").fill("exp-1")
+    page.locator("#tags-input").press("Enter")
+    page.locator("#tags-input").fill("draft")
+    page.locator("#tags-input").press(",")  # comma commits
+    expect(page.locator("#tags-editor-chips .chip")).to_have_count(3)
+
+    # Backspace on empty input removes the last chip.
+    page.locator("#tags-input").press("Backspace")
+    expect(page.locator("#tags-editor-chips .chip")).to_have_count(2)
+
+    page.locator("#btn-tags-save").click()
+    # Page reloads after success — the persisted chips should reappear.
+    expect(page.locator("#tags-display .chip")).to_have_count(2)
+    expect(page.locator("#tags-display .chip", has_text="best")).to_be_visible()
+    expect(page.locator("#tags-display .chip", has_text="exp-1")).to_be_visible()
+
+
 def test_run_page_notes_edit_persists(live_server, tmp_path: Path, page: Page):
     """Type notes, save, reload — they should still be there."""
     url, _ = live_server

@@ -17,13 +17,27 @@
 </h1>
 
 <div id="tags-row" style="margin: -.25rem 0 1rem;">
-  {% if summary.tags %}
-    <span class="chips" id="tags-chips">
-      {% for t in summary.tags %}<span class="chip">{{ t }}</span>{% endfor %}
-    </span>
-  {% else %}
-    <span class="muted" id="tags-chips" style="font-size:.9rem;">no tags</span>
-  {% endif %}
+  <span id="tags-display">
+    {% if summary.tags %}
+      <span class="chips">
+        {% for t in summary.tags %}<span class="chip">{{ t }}</span>{% endfor %}
+      </span>
+    {% else %}
+      <span class="muted" style="font-size:.9rem;">no tags</span>
+    {% endif %}
+  </span>
+  <span id="tags-editor" hidden style="display: inline-flex; gap: .5rem; align-items: center; flex-wrap: wrap;">
+    <span id="tags-editor-chips" class="chips"></span>
+    <input
+      type="text"
+      id="tags-input"
+      autocomplete="off"
+      placeholder="type, Enter to add"
+      style="min-width: 10rem;"
+    />
+    <button id="btn-tags-save" class="primary">Save</button>
+    <button id="btn-tags-cancel">Cancel</button>
+  </span>
 </div>
 
 <details>
@@ -238,22 +252,92 @@
   const currentTags = {{ summary.tags | tojson }};
   const currentArchived = {{ summary.archived | tojson }};
 
-  btnTags.addEventListener("click", async () => {
-    const next = prompt("Tags (comma-separated):", currentTags.join(", "));
-    if (next === null) return;
-    const tags = next.split(",").map(s => s.trim()).filter(Boolean);
+  // Inline chip editor — replaces the old prompt()-based flow.
+  const tagsDisplay = document.getElementById("tags-display");
+  const tagsEditor = document.getElementById("tags-editor");
+  const tagsEditorChips = document.getElementById("tags-editor-chips");
+  const tagInput = document.getElementById("tags-input");
+  const btnTagsSave = document.getElementById("btn-tags-save");
+  const btnTagsCancel = document.getElementById("btn-tags-cancel");
+  let editingTags = [];
+
+  function renderEditorChips() {
+    tagsEditorChips.innerHTML = "";
+    editingTags.forEach((t, i) => {
+      const chip = document.createElement("span");
+      chip.className = "chip";
+      chip.textContent = t;
+      const x = document.createElement("button");
+      x.type = "button";
+      x.textContent = "×";
+      x.setAttribute("aria-label", `remove ${t}`);
+      x.style.cssText = "margin-left:.35rem;padding:0 .25rem;background:transparent;border:none;color:var(--muted);cursor:pointer;font:inherit;line-height:1;";
+      x.addEventListener("click", () => {
+        editingTags.splice(i, 1);
+        renderEditorChips();
+        tagInput.focus();
+      });
+      chip.appendChild(x);
+      tagsEditorChips.appendChild(chip);
+    });
+  }
+
+  function commitPending() {
+    const v = tagInput.value.trim();
+    if (v && !editingTags.includes(v)) {
+      editingTags.push(v);
+      renderEditorChips();
+    }
+    tagInput.value = "";
+  }
+
+  function startEdit() {
+    editingTags = [...currentTags];
+    renderEditorChips();
+    tagsDisplay.hidden = true;
+    tagsEditor.hidden = false;
+    tagInput.focus();
+  }
+
+  function cancelEdit() {
+    tagsDisplay.hidden = false;
+    tagsEditor.hidden = true;
+    tagInput.value = "";
+  }
+
+  btnTags.addEventListener("click", startEdit);
+  btnTagsCancel.addEventListener("click", cancelEdit);
+
+  tagInput.addEventListener("keydown", e => {
+    if (e.key === "Enter" || e.key === ",") {
+      e.preventDefault();
+      commitPending();
+    } else if (e.key === "Backspace" && tagInput.value === "" && editingTags.length) {
+      editingTags.pop();
+      renderEditorChips();
+    } else if (e.key === "Escape") {
+      cancelEdit();
+    }
+  });
+
+  btnTagsSave.addEventListener("click", async () => {
+    commitPending();  // capture any unsubmitted input
+    btnTagsSave.disabled = true;
     try {
       const r = await endlex.authedFetch(
         `/api/runs/${encodeURIComponent(RUN)}/state`,
         {
           method: "PATCH",
           headers: {"Content-Type": "application/json"},
-          body: JSON.stringify({tags}),
+          body: JSON.stringify({tags: editingTags}),
         }
       );
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       location.reload();
-    } catch (e) { alert(`Tag update failed: ${e.message}`); }
+    } catch (e) {
+      alert(`Tag update failed: ${e.message}`);
+      btnTagsSave.disabled = false;
+    }
   });
 
   btnArchive.addEventListener("click", async () => {
