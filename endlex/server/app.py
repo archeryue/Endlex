@@ -39,7 +39,11 @@ def create_app(data_root: str | os.PathLike[str] | None = None) -> FastAPI:
     root = (
         data_root if data_root is not None else os.environ.get("ENDLEX_DATA", "./data")
     )
-    storage = Storage(root)
+    storage = Storage(
+        root,
+        default_keep_last=int(os.environ.get("ENDLEX_CKPT_KEEP_LAST", "0")),
+        default_max_age_days=float(os.environ.get("ENDLEX_CKPT_MAX_AGE_DAYS", "0")),
+    )
     templates = Jinja2Templates(directory=str(_TEMPLATE_DIR))
     app = FastAPI(title="Endlex", version="0.1.0")
     app.state.storage = storage
@@ -126,7 +130,29 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 — long but flat
             written[f.filename] = storage.write_checkpoint_file(
                 name, step, f.filename, f.file
             )
-        return {"name": name, "step": step, "written": written}
+        # Apply retention immediately after each successful upload so the
+        # disk doesn't blow past the cap between sweeps.
+        keep_last, max_age = storage.resolved_retention(name)
+        pruned = storage.prune_checkpoints(
+            name, keep_last=keep_last, max_age_seconds=max_age
+        )
+        return {"name": name, "step": step, "written": written, "pruned": pruned}
+
+    @app.post(
+        "/api/admin/prune",
+        dependencies=[Depends(require_write_auth)],
+    )
+    async def prune_all(storage: StorageDep):
+        """Apply retention to every run. For cron use."""
+        result: dict[str, list[str]] = {}
+        for s in storage.list_runs():
+            keep_last, max_age = storage.resolved_retention(s.name)
+            pruned = storage.prune_checkpoints(
+                s.name, keep_last=keep_last, max_age_seconds=max_age
+            )
+            if pruned:
+                result[s.name] = pruned
+        return {"pruned": result}
 
     @app.delete(
         "/api/runs/{name}",

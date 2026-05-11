@@ -241,3 +241,57 @@ def test_compare_empty_param(client):
     r = client.get("/compare")
     assert r.status_code == 200
     assert "No runs selected" in r.text
+
+
+# ---------- retention ----------
+
+def test_ckpt_upload_prunes_per_run_retention(client):
+    _init(client, "r")
+    # Per-run policy: keep only the last 2 checkpoints.
+    client.patch(
+        "/api/runs/r/state",
+        json={"retention": {"keep_last": 2}},
+        headers=AUTH,
+    )
+    for step in (100, 200, 300, 400):
+        r = client.post(
+            f"/api/runs/r/ckpt/{step}",
+            files=[("files", ("model.pt", io.BytesIO(b"x"), "application/octet-stream"))],
+            headers=AUTH,
+        )
+        assert r.status_code == 200
+    # The final upload's prune list should include the now-oldest dirs.
+    assert r.json()["pruned"], "expected the last upload to prune old ckpts"
+    steps = [c["step"] for c in client.get("/api/runs/r").json()["checkpoints"]]
+    assert steps == ["step_000300", "step_000400"]
+
+
+def test_admin_prune_all_endpoint(client):
+    _init(client, "a")
+    _init(client, "b")
+    for step in (100, 200, 300):
+        client.post(
+            f"/api/runs/a/ckpt/{step}",
+            files=[("files", ("model.pt", io.BytesIO(b"x"), "application/octet-stream"))],
+            headers=AUTH,
+        )
+    # No retention set yet on `a` → prune is no-op.
+    r = client.post("/api/admin/prune", headers=AUTH)
+    assert r.status_code == 200
+    assert r.json() == {"pruned": {}}
+    # Set retention then prune.
+    client.patch(
+        "/api/runs/a/state",
+        json={"retention": {"keep_last": 1}},
+        headers=AUTH,
+    )
+    r = client.post("/api/admin/prune", headers=AUTH)
+    body = r.json()
+    assert "a" in body["pruned"]
+    assert sorted(body["pruned"]["a"]) == ["step_000100", "step_000200"]
+    assert "b" not in body["pruned"]
+
+
+def test_admin_prune_requires_auth(client):
+    r = client.post("/api/admin/prune")
+    assert r.status_code == 401

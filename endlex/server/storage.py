@@ -51,7 +51,7 @@ class RunSummary:
     archived: bool
 
 
-_DEFAULT_STATE = {"tags": [], "archived": False}
+_DEFAULT_STATE: dict[str, Any] = {"tags": [], "archived": False, "retention": {}}
 
 
 def _validate_name(name: str) -> None:
@@ -74,12 +74,20 @@ def _step_dirname(step: str | int) -> str:
 
 
 class Storage:
-    def __init__(self, data_root: str | os.PathLike[str]):
+    def __init__(
+        self,
+        data_root: str | os.PathLike[str],
+        *,
+        default_keep_last: int = 0,
+        default_max_age_days: float = 0.0,
+    ):
         self.data_root = Path(data_root)
         self.runs_dir = self.data_root / "runs"
         self.ckpt_dir = self.data_root / "checkpoints"
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         self.ckpt_dir.mkdir(parents=True, exist_ok=True)
+        self.default_keep_last = max(0, int(default_keep_last))
+        self.default_max_age_days = max(0.0, float(default_max_age_days))
 
     # ----- runs -----
 
@@ -227,14 +235,15 @@ class Storage:
     def _read_state(run_dir: Path) -> dict[str, Any]:
         state_path = run_dir / "state.json"
         if not state_path.exists():
-            return dict(_DEFAULT_STATE)
+            return {"tags": [], "archived": False, "retention": {}}
         try:
             raw = json.loads(state_path.read_text())
         except json.JSONDecodeError:
-            return dict(_DEFAULT_STATE)
+            return {"tags": [], "archived": False, "retention": {}}
         return {
             "tags": list(raw.get("tags") or []),
             "archived": bool(raw.get("archived", False)),
+            "retention": dict(raw.get("retention") or {}),
         }
 
     # ----- state (tags / archived) -----
@@ -269,10 +278,33 @@ class Storage:
             state["tags"] = list(seen)
         if "archived" in patch:
             state["archived"] = bool(patch["archived"])
+        if "retention" in patch:
+            r = patch["retention"]
+            if not isinstance(r, dict):
+                raise InvalidName("retention must be an object")
+            normalized: dict[str, Any] = {}
+            if "keep_last" in r:
+                normalized["keep_last"] = max(0, int(r["keep_last"]))
+            if "max_age_days" in r:
+                normalized["max_age_days"] = max(0.0, float(r["max_age_days"]))
+            state["retention"] = normalized
         (run_dir / "state.json").write_text(
             json.dumps(state, indent=2, sort_keys=True)
         )
         return state
+
+    def resolved_retention(self, name: str) -> tuple[int, float]:
+        """Return (keep_last, max_age_seconds) for `name`.
+
+        Per-run state.json overrides the server defaults. Either or both
+        rules can be 0/unset (meaning "no limit on that dimension").
+        """
+        _validate_name(name)
+        run_dir = self.runs_dir / name
+        ret = self._read_state(run_dir).get("retention") or {}
+        keep_last = int(ret.get("keep_last", self.default_keep_last))
+        max_age_days = float(ret.get("max_age_days", self.default_max_age_days))
+        return keep_last, max_age_days * 86400.0
 
     # ----- checkpoints -----
 
@@ -324,3 +356,56 @@ class Storage:
             files = sorted(p.name for p in step_dir.iterdir() if p.is_file())
             out.append({"step": step_dir.name, "files": files})
         return out
+
+    def _checkpoint_step_dirs(self, name: str) -> list[tuple[int, Path]]:
+        """Return [(step_int, dir_path), ...] sorted by step ascending."""
+        _validate_name(name)
+        d = self.ckpt_dir / name
+        if not d.is_dir():
+            return []
+        out: list[tuple[int, Path]] = []
+        for p in d.iterdir():
+            if not p.is_dir() or not p.name.startswith("step_"):
+                continue
+            try:
+                step = int(p.name.split("_", 1)[1])
+            except ValueError:
+                continue
+            out.append((step, p))
+        out.sort()
+        return out
+
+    def prune_checkpoints(
+        self,
+        name: str,
+        *,
+        keep_last: int = 0,
+        max_age_seconds: float | None = None,
+    ) -> list[str]:
+        """Apply retention rules to one run's checkpoints.
+
+        Semantics (union-of-keepers): a step dir is kept if it falls within
+        the ``keep_last`` most-recent set OR its mtime is within
+        ``max_age_seconds``. With both rules unset (the defaults), this is a
+        no-op. Returns the list of deleted step dir names.
+        """
+        if keep_last <= 0 and (max_age_seconds is None or max_age_seconds <= 0):
+            return []
+        steps = self._checkpoint_step_dirs(name)
+        if not steps:
+            return []
+        keep: set[Path] = set()
+        if keep_last > 0:
+            keep.update(p for _, p in steps[-keep_last:])
+        if max_age_seconds is not None and max_age_seconds > 0:
+            cutoff = time.time() - max_age_seconds
+            for _, p in steps:
+                if p.stat().st_mtime >= cutoff:
+                    keep.add(p)
+        deleted: list[str] = []
+        for _, p in steps:
+            if p in keep:
+                continue
+            shutil.rmtree(p)
+            deleted.append(p.name)
+        return deleted

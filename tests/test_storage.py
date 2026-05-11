@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import time
 from pathlib import Path
 
 import pytest
@@ -139,7 +141,11 @@ def test_checkpoint_requires_existing_run(store: Storage):
 
 def test_get_state_defaults(store: Storage):
     store.init_run("r", {})
-    assert store.get_state("r") == {"tags": [], "archived": False}
+    assert store.get_state("r") == {
+        "tags": [],
+        "archived": False,
+        "retention": {},
+    }
 
 
 def test_update_state_persists_tags(store: Storage):
@@ -182,3 +188,85 @@ def test_state_missing_run_raises(store: Storage):
         store.get_state("ghost")
     with pytest.raises(RunNotFound):
         store.update_state("ghost", {"archived": True})
+
+
+# ---------- retention ----------
+
+def _seed_ckpts(store: Storage, run: str, steps: list[int]) -> None:
+    store.init_run(run, {})
+    for s in steps:
+        store.write_checkpoint_file(run, s, "model.pt", io.BytesIO(b"x"))
+
+
+def test_prune_no_rules_is_noop(store: Storage):
+    _seed_ckpts(store, "r", [100, 200, 300])
+    deleted = store.prune_checkpoints("r", keep_last=0, max_age_seconds=0)
+    assert deleted == []
+    assert len(store.list_checkpoints("r")) == 3
+
+
+def test_prune_keep_last_keeps_most_recent_steps(store: Storage):
+    _seed_ckpts(store, "r", [100, 200, 300, 400, 500])
+    deleted = store.prune_checkpoints("r", keep_last=2)
+    assert sorted(deleted) == ["step_000100", "step_000200", "step_000300"]
+    remaining = [c["step"] for c in store.list_checkpoints("r")]
+    assert remaining == ["step_000400", "step_000500"]
+
+
+def test_prune_keep_last_larger_than_count_is_noop(store: Storage):
+    _seed_ckpts(store, "r", [100, 200])
+    deleted = store.prune_checkpoints("r", keep_last=10)
+    assert deleted == []
+
+
+def test_prune_max_age_deletes_old(store: Storage, tmp_path: Path):
+    _seed_ckpts(store, "r", [100, 200, 300])
+    # Backdate step_000100 + 200 by 10 days; leave 300 fresh.
+    old = time.time() - 10 * 86400
+    for s in (100, 200):
+        d = store.ckpt_dir / "r" / f"step_{s:06d}"
+        os.utime(d, (old, old))
+    deleted = store.prune_checkpoints("r", max_age_seconds=5 * 86400)
+    assert sorted(deleted) == ["step_000100", "step_000200"]
+    remaining = [c["step"] for c in store.list_checkpoints("r")]
+    assert remaining == ["step_000300"]
+
+
+def test_prune_union_of_keep_last_and_max_age(store: Storage):
+    _seed_ckpts(store, "r", [100, 200, 300, 400])
+    # Make 100 + 200 old; 300 + 400 fresh.
+    old = time.time() - 10 * 86400
+    for s in (100, 200):
+        d = store.ckpt_dir / "r" / f"step_{s:06d}"
+        os.utime(d, (old, old))
+    # keep_last=1 wants to drop {100,200,300}, max_age wants to drop {100,200}.
+    # Union of keepers = {400 (recent step)} ∪ {300,400 (within age)} = {300,400}.
+    deleted = store.prune_checkpoints(
+        "r", keep_last=1, max_age_seconds=5 * 86400
+    )
+    assert sorted(deleted) == ["step_000100", "step_000200"]
+    remaining = [c["step"] for c in store.list_checkpoints("r")]
+    assert remaining == ["step_000300", "step_000400"]
+
+
+def test_resolved_retention_falls_back_to_server_default(tmp_path: Path):
+    s = Storage(tmp_path, default_keep_last=3, default_max_age_days=7.0)
+    s.init_run("r", {})
+    keep, max_age = s.resolved_retention("r")
+    assert keep == 3
+    assert max_age == 7 * 86400
+
+
+def test_resolved_retention_per_run_overrides_default(tmp_path: Path):
+    s = Storage(tmp_path, default_keep_last=3, default_max_age_days=7.0)
+    s.init_run("r", {})
+    s.update_state("r", {"retention": {"keep_last": 1, "max_age_days": 0}})
+    keep, max_age = s.resolved_retention("r")
+    assert keep == 1
+    assert max_age == 0
+
+
+def test_update_state_validates_retention_shape(store: Storage):
+    store.init_run("r", {})
+    with pytest.raises(InvalidName):
+        store.update_state("r", {"retention": [1, 2]})
