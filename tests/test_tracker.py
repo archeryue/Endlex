@@ -180,3 +180,121 @@ def test_missing_project_or_name_raises(tmp_path: Path):
         Tracker(project="", name="x", local_dir=tmp_path)
     with pytest.raises(ValueError):
         Tracker(project="x", name="", local_dir=tmp_path)
+
+
+# ---------- retry-with-backoff ----------
+
+def _mock_handler_factory(behaviors: list, *, init_ok: bool = True):
+    """`behaviors` is a list of HTTP status codes (or callables) for /metrics POSTs.
+    Each call to /metrics POPs the next behavior. /init always returns 200 unless
+    init_ok=False (returns 503).
+    """
+    state = {"metrics_calls": 0, "init_calls": 0}
+
+    def handler(request):
+        if "/init" in request.url.path:
+            state["init_calls"] += 1
+            return httpx.Response(200 if init_ok else 503)
+        if "/metrics" in request.url.path:
+            i = state["metrics_calls"]
+            state["metrics_calls"] += 1
+            spec = behaviors[i] if i < len(behaviors) else behaviors[-1]
+            if callable(spec):
+                return spec(request)
+            return httpx.Response(spec, json={"appended": 1})
+        return httpx.Response(404)
+
+    return handler, state
+
+
+import httpx  # noqa: E402
+
+
+def _make_tracker_with_handler(tmp_path: Path, handler, **kw):
+    client = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://test")
+    client.headers["Authorization"] = "Bearer t"
+    kw.setdefault("retry_delays", (0.01, 0.02))  # tiny delays for fast tests
+    return Tracker(
+        project="p",
+        name="n",
+        config={},
+        local_dir=tmp_path / "local",
+        batch_size=1,
+        batch_interval=0.05,
+        _client=client,
+        **kw,
+    )
+
+
+def test_post_retries_on_5xx_then_succeeds(tmp_path: Path):
+    handler, state = _mock_handler_factory([503, 503, 200])
+    t = _make_tracker_with_handler(tmp_path, handler)
+    t.log({"step": 1})
+    t.finish(timeout=5)
+    # Init (1) + 3 metrics attempts (2 failures + 1 success).
+    assert state["metrics_calls"] == 3
+    assert t.failed_requests == 2
+    assert "HTTP 503" in (t.last_error or "")
+
+
+def test_post_retries_exhausted_returns_failure(tmp_path: Path):
+    handler, state = _mock_handler_factory([503, 503, 503, 503])
+    t = _make_tracker_with_handler(tmp_path, handler)
+    t.log({"step": 1})
+    t.finish(timeout=5)
+    # retry_delays=(0.01, 0.02) → 3 total attempts.
+    assert state["metrics_calls"] == 3
+    assert t.failed_requests == 3
+
+
+def test_post_4xx_does_not_retry(tmp_path: Path):
+    handler, state = _mock_handler_factory([403])
+    t = _make_tracker_with_handler(tmp_path, handler)
+    t.log({"step": 1})
+    t.finish(timeout=5)
+    # 4xx → single attempt, no retry.
+    assert state["metrics_calls"] == 1
+    assert t.failed_requests == 1
+    assert "HTTP 403" in (t.last_error or "")
+
+
+def test_post_retries_on_transport_error(tmp_path: Path):
+    """Transport-level errors (connection refused, etc.) also trigger retry."""
+    calls = {"n": 0}
+
+    def handler(request):
+        if "/init" in request.url.path:
+            return httpx.Response(200)
+        calls["n"] += 1
+        if calls["n"] < 2:
+            raise httpx.ConnectError("simulated network blip")
+        return httpx.Response(200, json={"appended": 1})
+
+    t = _make_tracker_with_handler(tmp_path, handler)
+    t.log({"step": 1})
+    t.finish(timeout=5)
+    assert calls["n"] == 2
+    assert t.failed_requests == 1
+    assert "ConnectError" in (t.last_error or "")
+
+
+def test_retry_does_not_run_on_trainer_thread(tmp_path: Path):
+    """Hot path stays fast even when the daemon is in the middle of backoff."""
+    import time as _t
+
+    handler, _ = _mock_handler_factory([503, 503, 503])  # always 5xx; daemon sleeps
+    t = _make_tracker_with_handler(
+        tmp_path, handler, retry_delays=(0.2, 0.4)  # noticeable sleeps
+    )
+    # While the daemon is retrying, log() on the trainer thread must stay tight.
+    samples = []
+    for _ in range(200):
+        start = _t.perf_counter_ns()
+        t.log({"step": 1, "v": 1.0})
+        samples.append(_t.perf_counter_ns() - start)
+    samples.sort()
+    median_us = samples[len(samples) // 2] / 1000
+    p99_us = samples[int(len(samples) * 0.99)] / 1000
+    t.finish(timeout=5)
+    assert median_us < 100, f"median log() {median_us:.1f}µs blew past budget while retrying"
+    assert p99_us < 500, f"p99 log() {p99_us:.1f}µs blew past 500µs ceiling"

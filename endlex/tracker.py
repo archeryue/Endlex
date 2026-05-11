@@ -17,9 +17,10 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from collections import deque
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
@@ -27,6 +28,7 @@ _DEFAULT_BATCH_SIZE = 100
 _DEFAULT_BATCH_INTERVAL = 5.0
 _DEFAULT_QUEUE_MAX = 10_000
 _DEFAULT_LOCAL_ROOT = "./endlex_runs"
+_DEFAULT_RETRY_DELAYS: tuple[float, ...] = (0.5, 1.0, 2.0)
 
 
 class Tracker:
@@ -45,6 +47,7 @@ class Tracker:
         batch_interval: float = _DEFAULT_BATCH_INTERVAL,
         queue_max: int = _DEFAULT_QUEUE_MAX,
         force: bool = False,
+        retry_delays: tuple[float, ...] = _DEFAULT_RETRY_DELAYS,
         _client: httpx.Client | None = None,  # test seam
     ) -> None:
         if not project or not name:
@@ -59,8 +62,11 @@ class Tracker:
         self._force = force
         self.batch_size = max(1, int(batch_size))
         self.batch_interval = float(batch_interval)
+        self.retry_delays = tuple(float(d) for d in retry_delays)
         self._queue: deque[dict[str, Any]] = deque(maxlen=int(queue_max))
         self._dropped = 0
+        self._failed_requests = 0
+        self._last_error: str | None = None
 
         root = Path(
             local_dir
@@ -150,6 +156,16 @@ class Tracker:
         """Count of events dropped from the *remote* queue (local has them)."""
         return self._dropped
 
+    @property
+    def failed_requests(self) -> int:
+        """Cumulative count of failed HTTP attempts (5xx, 4xx, or transport)."""
+        return self._failed_requests
+
+    @property
+    def last_error(self) -> str | None:
+        """Last observed error string, or None if no requests have failed."""
+        return self._last_error
+
     # ---------- daemon ----------
 
     def _loop(self) -> None:
@@ -162,17 +178,43 @@ class Tracker:
             self._drain_one_batch()
         self._drain_all()
 
+    def _request_with_retry(
+        self, fn: Callable[[], httpx.Response]
+    ) -> httpx.Response | None:
+        """Exponential-backoff retry on 5xx and transport errors.
+
+        Returns the final response (which may itself be a non-200 4xx) or
+        ``None`` if every attempt raised. 4xx is *not* retried — it's the
+        caller's bug, not the network's. Failures increment
+        ``self._failed_requests`` so the metric is observable.
+        """
+        delays = self.retry_delays
+        for i in range(len(delays) + 1):
+            try:
+                r = fn()
+                if r.status_code == 200:
+                    return r
+                self._last_error = f"HTTP {r.status_code}"
+                self._failed_requests += 1
+                if r.status_code < 500:
+                    return r  # non-retryable
+            except httpx.HTTPError as e:
+                self._last_error = f"{type(e).__name__}: {e}"
+                self._failed_requests += 1
+            if i < len(delays):
+                time.sleep(delays[i])
+        return None
+
     def _init_remote(self) -> bool:
         params = {"force": "true"} if self._force else None
-        try:
-            r = self._client.post(
+        r = self._request_with_retry(
+            lambda: self._client.post(
                 f"/api/runs/{self.name}/init",
                 json=self.config,
                 params=params,
             )
-        except httpx.HTTPError:
-            return False
-        return r.status_code == 200
+        )
+        return r is not None and r.status_code == 200
 
     def _take_batch(self) -> list[dict[str, Any]]:
         batch: list[dict[str, Any]] = []
@@ -184,13 +226,12 @@ class Tracker:
         return batch
 
     def _post_batch(self, batch: list[dict[str, Any]]) -> bool:
-        try:
-            r = self._client.post(
+        r = self._request_with_retry(
+            lambda: self._client.post(
                 f"/api/runs/{self.name}/metrics", json=batch
             )
-        except httpx.HTTPError:
-            return False
-        return r.status_code == 200
+        )
+        return r is not None and r.status_code == 200
 
     def _drain_one_batch(self) -> None:
         batch = self._take_batch()
