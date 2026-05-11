@@ -8,9 +8,13 @@
 {% block body %}
 <h1>Runs</h1>
 {% if runs %}
+<div style="margin-bottom: .75rem; display: flex; gap: .5rem; align-items: center;">
+  <button id="btn-compare" disabled>Compare selected (0)</button>
+</div>
 <table id="runs">
   <thead>
     <tr>
+      <th style="width:1.5rem;"><input type="checkbox" id="check-all" title="select all visible" /></th>
       <th class="sortable" data-key="name">Name <span class="arrow"></span></th>
       <th>Tags</th>
       <th class="sortable desc" data-key="last_updated">Last updated <span class="arrow"></span></th>
@@ -31,6 +35,7 @@
       data-train_loss="{% if run.latest and run.latest['train/loss'] is defined %}{{ run.latest['train/loss'] }}{% else %}{% endif %}"
       data-val_bpb="{% if run.latest and run.latest['val/bpb'] is defined %}{{ run.latest['val/bpb'] }}{% else %}{% endif %}"
     >
+      <td><input type="checkbox" class="row-check" data-name="{{ run.name }}" /></td>
       <td>
         <a href="/run/{{ run.name }}">{{ run.name }}</a>
         {% if run.archived %}<span class="chip archived" title="archived">archived</span>{% endif %}
@@ -111,6 +116,32 @@
   }
   showArchived.addEventListener("change", applyArchivedFilter);
   applyArchivedFilter();
+
+  // Compare-selected button
+  const btnCompare = document.getElementById("btn-compare");
+  const rowChecks = () => [...tbody.querySelectorAll("input.row-check")];
+  const checkAll = document.getElementById("check-all");
+  function refreshCompareBtn() {
+    const checked = rowChecks().filter(c => c.checked && c.closest("tr").style.display !== "none");
+    btnCompare.disabled = checked.length === 0;
+    btnCompare.textContent = `Compare selected (${checked.length})`;
+  }
+  tbody.addEventListener("change", e => {
+    if (e.target.matches("input.row-check")) refreshCompareBtn();
+  });
+  checkAll.addEventListener("change", () => {
+    rowChecks().forEach(c => {
+      if (c.closest("tr").style.display !== "none") c.checked = checkAll.checked;
+    });
+    refreshCompareBtn();
+  });
+  btnCompare.addEventListener("click", () => {
+    const names = rowChecks().filter(c => c.checked).map(c => c.dataset.name);
+    if (names.length) {
+      location.href = "/compare?runs=" + names.map(encodeURIComponent).join(",");
+    }
+  });
+  refreshCompareBtn();
 })();
 </script>
 {% endblock %}

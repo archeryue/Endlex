@@ -231,6 +231,30 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 — long but flat
             },
         )
 
+    @app.get(
+        "/compare",
+        response_class=HTMLResponse,
+        dependencies=[Depends(require_read_auth)],
+    )
+    async def compare(
+        request: Request,
+        storage: StorageDep,
+        runs: str = Query(default=""),
+    ):
+        wanted = [n.strip() for n in runs.split(",") if n.strip()]
+        valid: list[str] = []
+        for n in wanted:
+            try:
+                if storage.run_exists(n):
+                    valid.append(n)
+            except InvalidName:
+                continue
+        return _templates_of(request).TemplateResponse(
+            request,
+            "compare.html",
+            {"runs": valid, "missing": [n for n in wanted if n not in valid]},
+        )
+
 
 def main() -> None:
     import uvicorn

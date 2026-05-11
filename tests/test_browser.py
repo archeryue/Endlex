@@ -146,6 +146,38 @@ def test_dashboard_filters_archived(live_server, tmp_path: Path, page: Page):
     expect(archived_row.locator(".chip", has_text="wip")).to_be_visible()
 
 
+def test_compare_view_overlays_runs(live_server, tmp_path: Path, page: Page):
+    url, _ = live_server
+    _seed(url, tmp_path, name="alpha")
+    _seed(url, tmp_path, name="beta")
+
+    page.goto(f"{url}/compare?runs=alpha,beta")
+    expect(page).to_have_title(re.compile(r"Compare"))
+    # status text updates after first poll fires
+    expect(page.locator("#status")).to_contain_text("updated", timeout=15_000)
+    # at least one chart materialized with 2 datasets (legend will show both)
+    canvases = page.locator("#charts canvas")
+    canvases.first.wait_for(state="visible", timeout=10_000)
+    assert canvases.count() >= 4
+    page.screenshot(path="/tmp/endlex-compare.png", full_page=True)
+
+
+def test_dashboard_compare_button_navigates(live_server, tmp_path: Path, page: Page):
+    url, _ = live_server
+    _seed(url, tmp_path, name="alpha")
+    _seed(url, tmp_path, name="beta")
+    page.goto(url)
+    # Compare button starts disabled
+    expect(page.locator("#btn-compare")).to_be_disabled()
+    # Check both rows
+    page.locator('input.row-check[data-name="alpha"]').check()
+    page.locator('input.row-check[data-name="beta"]').check()
+    expect(page.locator("#btn-compare")).to_be_enabled()
+    expect(page.locator("#btn-compare")).to_have_text("Compare selected (2)")
+    page.locator("#btn-compare").click()
+    expect(page).to_have_url(re.compile(r"/compare\?runs="))
+
+
 def test_run_page_archive_button_works(live_server, tmp_path: Path, page: Page):
     url, _ = live_server
     _seed(url, tmp_path, name="r")

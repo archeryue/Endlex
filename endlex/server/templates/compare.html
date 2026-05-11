@@ -1,0 +1,146 @@
+{% extends "_base.html" %}
+{% block title %}Compare — Endlex{% endblock %}
+{% block head %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.6/dist/chart.umd.min.js"></script>
+{% endblock %}
+{% block body %}
+<h1>Compare</h1>
+
+{% if runs %}
+<p class="muted" style="margin-bottom:1rem;">
+  Comparing:
+  {% for r in runs %}<a href="/run/{{ r }}">{{ r }}</a>{% if not loop.last %}, {% endif %}{% endfor %}
+  {% if missing %}
+    &mdash; <span style="color:var(--danger);">missing:
+    {% for m in missing %}<code>{{ m }}</code>{% if not loop.last %}, {% endif %}{% endfor %}</span>
+  {% endif %}
+</p>
+
+<div id="charts" class="grid"></div>
+<div id="charts-empty" class="empty" style="display:none;">
+  <p>No overlapping metric keys yet across these runs.</p>
+</div>
+<p id="status" class="muted" style="margin-top:1rem;font-size:.85rem;">loading&hellip;</p>
+
+<script>
+(() => {
+  const RUNS = {{ runs | tojson }};
+  if (!RUNS.length) return;
+
+  const PANELS = [
+    ["train/loss vs step",        "step", "train/loss"],
+    ["val/bpb vs step",           "step", "val/bpb"],
+    ["val/bpb vs total_time",     "total_training_time",  "val/bpb"],
+    ["val/bpb vs total_flops",    "total_training_flops", "val/bpb"],
+    ["train/mfu vs step",         "step", "train/mfu"],
+    ["train/dt vs step",          "step", "train/dt"],
+    ["train/tok_per_sec vs step", "step", "train/tok_per_sec"],
+    ["train/lrm vs step",         "step", "train/lrm"],
+  ];
+
+  // Distinct, readable palette. Wraps if more runs than colors.
+  const PALETTE = [
+    "#2050b3", "#c0392b", "#16a085", "#d35400",
+    "#8e44ad", "#27ae60", "#e67e22", "#2980b9",
+    "#7f8c8d", "#e74c3c",
+  ];
+
+  const root = document.getElementById("charts");
+  const emptyHint = document.getElementById("charts-empty");
+  const status = document.getElementById("status");
+  const charts = {};
+  const cursors = Object.fromEntries(RUNS.map(r => [r, 0]));
+  const muted = getComputedStyle(document.documentElement)
+    .getPropertyValue("--muted").trim() || "#666";
+  const grid = getComputedStyle(document.documentElement)
+    .getPropertyValue("--border").trim() || "#e3e3e3";
+
+  function ensureChart(idx) {
+    if (charts[idx]) return charts[idx];
+    const [title, xk, yk] = PANELS[idx];
+    const wrap = document.createElement("section");
+    wrap.className = "panel";
+    wrap.innerHTML = `<h3>${title}</h3><canvas id="chart-${idx}" height="220"></canvas>`;
+    root.appendChild(wrap);
+    const ctx = wrap.querySelector("canvas").getContext("2d");
+    charts[idx] = new Chart(ctx, {
+      type: "line",
+      data: {
+        datasets: RUNS.map((r, i) => ({
+          label: r,
+          data: [],
+          borderColor: PALETTE[i % PALETTE.length],
+          backgroundColor: PALETTE[i % PALETTE.length],
+          borderWidth: 1.5,
+          pointRadius: 0,
+          showLine: true,
+        })),
+      },
+      options: {
+        responsive: true,
+        animation: false,
+        parsing: false,
+        scales: {
+          x: {
+            type: "linear",
+            title: { display: true, text: xk, color: muted, font: { size: 11 } },
+            ticks: { color: muted, font: { size: 10 }, maxRotation: 0, autoSkipPadding: 16 },
+            grid: { color: grid },
+          },
+          y: {
+            title: { display: true, text: yk, color: muted, font: { size: 11 } },
+            ticks: { color: muted, font: { size: 10 }, padding: 4 },
+            grid: { color: grid },
+          },
+        },
+        plugins: { legend: { display: true, position: "top", labels: { color: muted } } },
+      },
+    });
+    return charts[idx];
+  }
+
+  function append(runIdx, events) {
+    for (const e of events) {
+      PANELS.forEach(([_, xk, yk], pidx) => {
+        if (e[xk] == null || e[yk] == null) return;
+        const ch = ensureChart(pidx);
+        ch.data.datasets[runIdx].data.push({ x: Number(e[xk]), y: Number(e[yk]) });
+      });
+    }
+    Object.values(charts).forEach(c => c.update("none"));
+  }
+
+  function refreshEmptyState() {
+    emptyHint.style.display = Object.keys(charts).length ? "none" : "";
+  }
+
+  async function poll() {
+    const results = await Promise.allSettled(RUNS.map(r =>
+      fetch(`/api/runs/${encodeURIComponent(r)}/metrics?since=${cursors[r]}`)
+        .then(resp => resp.json())
+    ));
+    let any = false;
+    results.forEach((res, i) => {
+      if (res.status !== "fulfilled") return;
+      const run = RUNS[i];
+      cursors[run] = res.value.offset;
+      if (res.value.events.length) {
+        append(i, res.value.events);
+        any = true;
+      }
+    });
+    refreshEmptyState();
+    status.textContent = `updated ${new Date().toLocaleTimeString()}`;
+  }
+
+  poll();
+  setInterval(poll, 5000);
+})();
+</script>
+{% else %}
+<div class="empty">
+  <p>No runs selected for comparison.</p>
+  <p class="muted">Go to the <a href="/">dashboard</a>, check the rows you want to compare, and click <b>Compare selected</b>.</p>
+</div>
+{% endif %}
+{% endblock %}

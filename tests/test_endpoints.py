@@ -211,3 +211,33 @@ def test_patch_state_requires_auth(client):
 def test_patch_state_missing_run(client):
     r = client.patch("/api/runs/ghost/state", json={"archived": True}, headers=AUTH)
     assert r.status_code == 404
+
+
+# ---------- compare ----------
+
+def test_compare_renders_with_runs(client):
+    _init(client, "alpha")
+    _init(client, "beta")
+    r = client.get("/compare?runs=alpha,beta")
+    assert r.status_code == 200
+    assert "alpha" in r.text
+    assert "beta" in r.text
+    # Chart.js loaded; charts div present
+    assert "chart.umd.min.js" in r.text
+    assert 'id="charts"' in r.text
+
+
+def test_compare_filters_missing_runs(client):
+    _init(client, "alpha")
+    r = client.get("/compare?runs=alpha,ghost")
+    assert r.status_code == 200
+    assert "alpha" in r.text
+    # ghost shows up in "missing" notice
+    assert "ghost" in r.text
+    assert "missing" in r.text
+
+
+def test_compare_empty_param(client):
+    r = client.get("/compare")
+    assert r.status_code == 200
+    assert "No runs selected" in r.text
