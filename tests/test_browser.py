@@ -105,6 +105,28 @@ def test_dashboard_lists_runs(live_server, tmp_path: Path, page: Page):
     expect(page.get_by_role("link", name="beta")).to_be_visible()
     page.screenshot(path="/tmp/endlex-dashboard.png", full_page=True)
 
-    # Clicking a row navigates to the run page.
-    page.get_by_role("link", name="alpha").click()
+    # Sortable headers: clicking "Name" should sort alphabetically ascending,
+    # so the first body row's name link should be "alpha".
+    page.locator("th.sortable", has_text="Name").click()
+    first = page.locator("tbody tr").first.locator("a")
+    expect(first).to_have_text("alpha")
+
+    # Clicking the run link navigates to the run page.
+    first.click()
     expect(page).to_have_url(re.compile(r"/run/alpha$"))
+
+
+def test_dashboard_dark_mode(live_server, tmp_path: Path, browser):
+    """Sanity-check that the dark-mode palette renders without breaking layout."""
+    url, _ = live_server
+    _seed(url, tmp_path, name="dark")
+    ctx = browser.new_context(color_scheme="dark")
+    page = ctx.new_page()
+    page.goto(url)
+    expect(page).to_have_title("Endlex")
+    expect(page.locator("table tbody tr")).to_have_count(1)
+    page.screenshot(path="/tmp/endlex-dashboard-dark.png", full_page=True)
+    page.goto(f"{url}/run/dark")
+    expect(page.locator("#status")).to_contain_text("bytes consumed", timeout=15_000)
+    page.screenshot(path="/tmp/endlex-run-page-dark.png", full_page=True)
+    ctx.close()

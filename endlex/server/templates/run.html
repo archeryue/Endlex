@@ -7,25 +7,50 @@
 <h1>{{ name }} <span class="muted" style="font-weight:400;font-size:.9rem;">({{ summary.num_events }} events)</span></h1>
 
 <details>
-  <summary>Config</summary>
-  <pre>{{ config | tojson(indent=2) }}</pre>
+  <summary>Config ({{ config|length }} keys)</summary>
+  {% if config %}
+  <table class="kv">
+    <tbody>
+      {% for k, v in config|dictsort %}
+      <tr>
+        <td class="k">{{ k }}</td>
+        <td class="v">{{ v | tojson }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">empty config</p>
+  {% endif %}
 </details>
 
 <h2>Charts</h2>
 <div id="charts" class="grid"></div>
-<p id="status" class="muted" style="margin-top:1rem;">loading…</p>
+<div id="charts-empty" class="empty" style="display:none;">
+  <p>Waiting for metrics&hellip;</p>
+  <p class="muted">Panels appear automatically when their keys arrive (train/loss, val/bpb, train/mfu, train/dt, train/tok_per_sec, train/lrm).</p>
+</div>
+<p id="status" class="muted" style="margin-top:1rem;font-size:.85rem;">loading&hellip;</p>
 
 <h2>Checkpoints</h2>
 {% if checkpoints %}
-<ul>
-  {% for ck in checkpoints %}
-  <li><code>{{ ck.step }}</code>:
-    {% for f in ck.files %}
-      <a href="/api/runs/{{ name }}/ckpt/{{ ck.step.replace('step_', '')|int }}/{{ f }}">{{ f }}</a>{% if not loop.last %}, {% endif %}
+<table>
+  <thead>
+    <tr><th>Step</th><th>Files</th></tr>
+  </thead>
+  <tbody>
+    {% for ck in checkpoints %}
+    <tr>
+      <td><code>{{ ck.step }}</code></td>
+      <td>
+        {% for f in ck.files %}
+          <a href="/api/runs/{{ name }}/ckpt/{{ ck.step.replace('step_', '')|int }}/{{ f }}">{{ f }}</a>{% if not loop.last %}, {% endif %}
+        {% endfor %}
+      </td>
+    </tr>
     {% endfor %}
-  </li>
-  {% endfor %}
-</ul>
+  </tbody>
+</table>
 {% else %}
 <p class="muted">No checkpoints uploaded.</p>
 {% endif %}
@@ -47,9 +72,21 @@
   ];
 
   const root = document.getElementById("charts");
+  const emptyHint = document.getElementById("charts-empty");
   const status = document.getElementById("status");
   const charts = {};
   let cursor = 0;
+  let firstPollDone = false;
+
+  const accent =
+    getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() ||
+    "#2050b3";
+  const grid =
+    getComputedStyle(document.documentElement).getPropertyValue("--border").trim() ||
+    "#e3e3e3";
+  const muted =
+    getComputedStyle(document.documentElement).getPropertyValue("--muted").trim() ||
+    "#666";
 
   function ensureChart(idx) {
     if (charts[idx]) return charts[idx];
@@ -63,7 +100,8 @@
       type: "line",
       data: { datasets: [{
         data: [],
-        borderColor: getComputedStyle(document.documentElement).getPropertyValue("--accent") || "#2050b3",
+        borderColor: accent,
+        backgroundColor: accent,
         borderWidth: 1.5,
         pointRadius: 0,
         showLine: true,
@@ -73,8 +111,17 @@
         animation: false,
         parsing: false,
         scales: {
-          x: { type: "linear", title: { display: true, text: xk } },
-          y: { title: { display: true, text: yk } },
+          x: {
+            type: "linear",
+            title: { display: true, text: xk, color: muted, font: { size: 11 } },
+            ticks: { color: muted, font: { size: 10 }, maxRotation: 0, autoSkipPadding: 16 },
+            grid: { color: grid },
+          },
+          y: {
+            title: { display: true, text: yk, color: muted, font: { size: 11 } },
+            ticks: { color: muted, font: { size: 10 }, padding: 4 },
+            grid: { color: grid },
+          },
         },
         plugins: { legend: { display: false } },
       },
@@ -94,6 +141,11 @@
     Object.values(charts).forEach(c => c.update("none"));
   }
 
+  function refreshEmptyState() {
+    const has = Object.keys(charts).length > 0;
+    emptyHint.style.display = has ? "none" : "";
+  }
+
   async function poll() {
     try {
       const r = await fetch(`/api/runs/${encodeURIComponent(RUN)}/metrics?since=${cursor}`);
@@ -101,6 +153,8 @@
       const body = await r.json();
       cursor = body.offset;
       append(body.events);
+      firstPollDone = true;
+      refreshEmptyState();
       status.textContent = `${cursor} bytes consumed · updated ${new Date().toLocaleTimeString()}`;
     } catch (e) {
       status.textContent = `error: ${e.message}`;

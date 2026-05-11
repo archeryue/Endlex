@@ -3,43 +3,93 @@
 {% block body %}
 <h1>Runs</h1>
 {% if runs %}
-<table>
+<table id="runs">
   <thead>
     <tr>
-      <th>Name</th>
-      <th>Last updated</th>
-      <th>Events</th>
-      <th>Latest step</th>
-      <th>train/loss</th>
-      <th>val/bpb</th>
+      <th class="sortable" data-key="name">Name <span class="arrow"></span></th>
+      <th class="sortable desc" data-key="last_updated">Last updated <span class="arrow"></span></th>
+      <th class="sortable num" data-key="num_events">Events <span class="arrow"></span></th>
+      <th class="sortable num" data-key="latest_step">Latest step <span class="arrow"></span></th>
+      <th class="sortable num" data-key="train_loss">train/loss <span class="arrow"></span></th>
+      <th class="sortable num" data-key="val_bpb">val/bpb <span class="arrow"></span></th>
     </tr>
   </thead>
   <tbody>
     {% for run in runs %}
-    <tr>
+    <tr
+      data-name="{{ run.name }}"
+      data-last_updated="{{ run.last_updated or 0 }}"
+      data-num_events="{{ run.num_events }}"
+      data-latest_step="{% if run.latest and run.latest.step is defined %}{{ run.latest.step }}{% else %}-1{% endif %}"
+      data-train_loss="{% if run.latest and run.latest['train/loss'] is defined %}{{ run.latest['train/loss'] }}{% else %}{% endif %}"
+      data-val_bpb="{% if run.latest and run.latest['val/bpb'] is defined %}{{ run.latest['val/bpb'] }}{% else %}{% endif %}"
+    >
       <td><a href="/run/{{ run.name }}">{{ run.name }}</a></td>
       <td class="muted">
-        {% if run.last_updated %}
-          <span data-ts="{{ run.last_updated }}">{{ run.last_updated|round|int }}</span>
-        {% else %}&mdash;{% endif %}
+        {% if run.last_updated %}<span data-ts="{{ run.last_updated }}">{{ run.last_updated|round|int }}</span>{% else %}&mdash;{% endif %}
       </td>
-      <td>{{ run.num_events }}</td>
-      <td>{% if run.latest and run.latest.step is defined %}{{ run.latest.step }}{% else %}&mdash;{% endif %}</td>
-      <td>{% if run.latest and run.latest["train/loss"] is defined %}{{ "%.4f"|format(run.latest["train/loss"]) }}{% else %}&mdash;{% endif %}</td>
-      <td>{% if run.latest and run.latest["val/bpb"] is defined %}{{ "%.4f"|format(run.latest["val/bpb"]) }}{% else %}&mdash;{% endif %}</td>
+      <td class="num">{{ run.num_events }}</td>
+      <td class="num">{% if run.latest and run.latest.step is defined %}{{ run.latest.step }}{% else %}&mdash;{% endif %}</td>
+      <td class="num">{% if run.latest and run.latest['train/loss'] is defined %}{{ "%.4f"|format(run.latest['train/loss']) }}{% else %}&mdash;{% endif %}</td>
+      <td class="num">{% if run.latest and run.latest['val/bpb'] is defined %}{{ "%.4f"|format(run.latest['val/bpb']) }}{% else %}&mdash;{% endif %}</td>
     </tr>
     {% endfor %}
   </tbody>
 </table>
 {% else %}
-<p class="muted">No runs yet. POST to <code>/api/runs/&lt;name&gt;/init</code> to start one.</p>
+<div class="empty">
+  <p>No runs yet.</p>
+  <p class="muted">POST a config to <code>/api/runs/&lt;name&gt;/init</code> to start one.</p>
+</div>
 {% endif %}
 <script>
-  // Replace epoch seconds with locale time.
+(() => {
+  // Relative-time-ish format for the last-updated column.
   document.querySelectorAll("[data-ts]").forEach(el => {
     const t = parseFloat(el.dataset.ts) * 1000;
     if (!Number.isFinite(t)) return;
     el.textContent = new Date(t).toLocaleString();
   });
+
+  // Sortable columns: click a header to sort by it.
+  const table = document.getElementById("runs");
+  if (!table) return;
+  const tbody = table.querySelector("tbody");
+  const headers = [...table.querySelectorAll("th.sortable")];
+
+  function cmp(a, b, key, dir) {
+    const av = a.dataset[key];
+    const bv = b.dataset[key];
+    const an = Number(av), bn = Number(bv);
+    const both_num = av !== "" && bv !== "" && !Number.isNaN(an) && !Number.isNaN(bn);
+    let r;
+    if (av === "" && bv === "") r = 0;
+    else if (av === "") r = 1;          // empty sorts last
+    else if (bv === "") r = -1;
+    else if (both_num) r = an - bn;
+    else r = String(av).localeCompare(String(bv));
+    return dir === "asc" ? r : -r;
+  }
+
+  function sortBy(key, dir) {
+    const rows = [...tbody.querySelectorAll("tr")];
+    rows.sort((a, b) => cmp(a, b, key, dir));
+    rows.forEach(r => tbody.appendChild(r));
+    headers.forEach(h => {
+      h.classList.toggle("asc",  h.dataset.key === key && dir === "asc");
+      h.classList.toggle("desc", h.dataset.key === key && dir === "desc");
+    });
+  }
+
+  headers.forEach(h => {
+    h.addEventListener("click", () => {
+      // Toggle if already active; otherwise default to ascending.
+      const dir = h.classList.contains("asc") ? "desc" : "asc";
+      sortBy(h.dataset.key, dir);
+    });
+  });
+  // Initial sort: most-recently-updated first.
+  sortBy("last_updated", "desc");
+})();
 </script>
 {% endblock %}
