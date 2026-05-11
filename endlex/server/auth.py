@@ -8,6 +8,7 @@ the same token on reads too.
 from __future__ import annotations
 
 import os
+import secrets
 
 from fastapi import Header, HTTPException, status
 
@@ -30,7 +31,9 @@ def _check_bearer(authorization: str | None) -> None:
             status.HTTP_401_UNAUTHORIZED, "missing bearer token"
         )
     presented = authorization.split(None, 1)[1].strip()
-    if presented != _expected_token():
+    # Constant-time compare to avoid leaking the token byte-by-byte via timing
+    # — overkill for single-user but the fix is one line.
+    if not secrets.compare_digest(presented, _expected_token()):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "bad token")
 
 
