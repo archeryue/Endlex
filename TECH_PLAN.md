@@ -140,26 +140,25 @@ Hard rules:
 
 ## Roadmap
 
-### v1 — minimum viable, single file each side
-- [ ] `server.py` — FastAPI app with the endpoints above
-- [ ] `endlex/tracker.py` — `Tracker` class with the wandb-shaped API + performance contract
-- [ ] `endlex/checkpoint_sync.py` — upload helper called from `save_checkpoint`
-- [ ] `templates/dashboard.html` — list of runs
-- [ ] `templates/run.html` — config + charts for one run
-- [ ] Bearer-token auth middleware
-- [ ] Systemd unit + nginx config snippet
+### v1 — minimum viable
+- [x] FastAPI server (`endlex/server/app.py`) with all endpoints
+- [x] `endlex/tracker.py` — `Tracker` with wandb-shaped API + perf contract
+- [x] `endlex/checkpoint_sync.py` — upload helpers called from `save_checkpoint`
+- [x] `templates/dashboard.html` + `templates/run.html` with Chart.js
+- [x] Bearer-token auth (write always; read optional via `ENDLEX_PUBLIC_READS`)
+- [x] Systemd unit + nginx config snippet in `deploy/`
 
 ### v2 — quality of life
-- [ ] Run comparison view (overlay multiple runs on one chart)
-- [ ] Tag / archive / delete runs from UI
-- [ ] Configurable retention policy for checkpoints
-- [ ] Metrics search ("show me all runs where val_bpb < 0.8")
+- [x] Run comparison view (`/compare?runs=a,b,c`)
+- [x] Tag / archive / delete runs from UI (state.json + PATCH endpoint + buttons)
+- [x] Configurable retention policy (`ENDLEX_CKPT_KEEP_LAST` / `…_MAX_AGE_DAYS`, per-run override)
+- [x] Metrics search (dashboard search box: substring | `tag:foo` | `key<op>num`)
 
 ### v3 — nice-to-haves
-- [ ] SSE / websocket for live updates instead of polling
-- [ ] System metrics (GPU util, VRAM, power) sourced via `pynvml` inside the trainer
-- [ ] Sample text panel (model generations during training)
-- [ ] Export run as a static HTML report (for sharing without exposing the live server)
+- [x] SSE for live updates (`/api/runs/<name>/metrics/stream`, fallback to polling)
+- [x] Static HTML export (`/api/runs/<name>/export.html`, self-contained)
+- [ ] System metrics (GPU util, VRAM, power) sourced via `pynvml` inside the trainer — deferred; no Endlex-side change needed beyond logging the keys, but no test path here without a real GPU
+- [ ] Sample text panel (model generations during training) — deferred; needs a schema decision (how does the trainer log multi-line text, and how does the dashboard render it?)
 
 ## Use with ArcherChat
 
