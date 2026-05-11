@@ -37,13 +37,26 @@ The cloud trainer should `pip install endlex` (no `--extra server`) — the clie
 
 These are landed and tested; treat them as the authoritative behavior rather than re-reading TECH_PLAN for them:
 
-- **Run state**: `runs/<name>/state.json` holds `{tags, archived, retention}`. `PATCH /api/runs/<name>/state` is the write surface; dashboard surfaces tag chips and an archived chip.
-- **Compare overlay**: `/compare?runs=a,b,c` overlays multiple runs on the standard panels. Dashboard has row checkboxes + "Compare selected" button.
-- **Checkpoint retention**: env defaults `ENDLEX_CKPT_KEEP_LAST` / `ENDLEX_CKPT_MAX_AGE_DAYS`, per-run override via state.json `retention`. Prune happens after each upload + on `POST /api/admin/prune`.
+- **Run state** in `runs/<name>/state.json`: `{tags, archived, retention, notes}`. Write via `PATCH /api/runs/<name>/state`. Dashboard surfaces tag chips + archived chip + show-archived toggle. Run page has an inline chip editor (Enter/comma to add, × or Backspace to remove) + a notes textarea.
+- **Compare overlay**: `/compare?runs=a,b,c` overlays selected runs on the standard chart panels. Dashboard has row checkboxes + "Compare selected" button.
+- **Checkpoint retention**: env defaults `ENDLEX_CKPT_KEEP_LAST` / `ENDLEX_CKPT_MAX_AGE_DAYS`, per-run override via state.json `retention`. Prune happens after each upload + on `POST /api/admin/prune` (for cron).
 - **Search/filter**: dashboard search box grammar — substring | `tag:foo` | `key<op>num` (key on the latest metric event; ops `<`, `<=`, `>`, `>=`, `=`). Space-separated terms AND together.
-- **Live updates**: `GET /api/runs/<name>/metrics/stream` is an SSE endpoint emitting `event: metric` per new event. Run + compare pages upgrade to EventSource after the initial poll and fall back to 5s polling on error.
-- **Static export**: `GET /api/runs/<name>/export.html` returns a self-contained HTML report with all metrics embedded as JSON and the same chart panels (Chart.js from CDN). Append `?download=1` for `Content-Disposition: attachment`.
-- **Write auth in the browser**: `_base.html` exposes `endlex.authedFetch(url, opts)` which lazy-prompts for `ENDLEX_TOKEN`, caches it in `localStorage`, and clears on 401/403.
+- **Live updates via SSE**: `GET /api/runs/<name>/metrics/stream` emits `event: metric` per new event. Hard `max_lifetime` cap (env `ENDLEX_SSE_MAX_LIFETIME_SEC`, default 3600). Run + compare pages upgrade to EventSource after the initial poll and fall back to 5s polling on error.
+- **Static HTML export**: `GET /api/runs/<name>/export.html` returns a self-contained report with all metrics embedded as JSON and the same chart panels (Chart.js from CDN). `?download=1` sets attachment header.
+- **Summary cache**: `runs/<name>/.summary.json` sidecar bumped by `append_metrics`. Cache validity by `metrics_size`; mismatch triggers a rescan + repopulate. Keeps `list_runs()` O(1) per run even for very large JSONLs. Perf-gated test verifies cached `list_runs()` < 100 ms over 30 runs × 5k events and ≥5× faster than uncached.
+- **/health**: unauthenticated probe returning `{status, version, runs}`.
+- **Write auth in the browser**: `_base.html` exposes `endlex.authedFetch(url, opts)` which lazy-prompts for `ENDLEX_TOKEN`, caches in `localStorage`, clears on 401/403. Server uses `secrets.compare_digest` for constant-time token check.
+
+## Tracker hardening beyond the original spec
+
+- **Retry-with-backoff** on 5xx + transport errors. Daemon-thread only; hot path unchanged. Configurable via `retry_delays` kwarg (default `(0.5, 1.0, 2.0)` → 4 attempts). 4xx never retried.
+- **Resync on init**: if the local JSONL has events past the server's count (cloud trainer restart), ship the gap. Scoped to `_initial_local_count` snapshotted at construction to avoid double-shipping events logged in the current session.
+- **`flush(timeout)`**: synchronously drains the queue + waits for in-flight batch. Use between epochs or before checkpoint upload. Offline-mode no-op.
+- **Warn-at-finish**: stderr warning if `dropped` or `failed_requests` > 0 at finish time. Easy to miss otherwise — hot path swallows everything.
+
+## CI
+
+`.github/workflows/test.yml` runs `pytest -q` on every push to main + on PRs. Caches uv resolution + Playwright Chromium. Local equivalent: `uv run pytest -q`.
 
 ## What Endlex is
 
