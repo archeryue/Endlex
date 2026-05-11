@@ -180,8 +180,41 @@
     }
   }
 
-  poll();
-  setInterval(poll, 5000);
+  let pollTimer = null;
+  function startPolling() {
+    if (pollTimer) return;
+    pollTimer = setInterval(poll, 5000);
+  }
+  function stopPolling() {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  }
+
+  // Initial bulk load via the regular endpoint (fast, one round-trip).
+  poll().then(() => {
+    // Then upgrade to SSE for live updates. Fall back to polling on error.
+    let es;
+    try {
+      es = new EventSource(
+        `/api/runs/${encodeURIComponent(RUN)}/metrics/stream?since=${cursor}`
+      );
+    } catch (_) { startPolling(); return; }
+
+    let sseOpen = false;
+    es.addEventListener("open", () => { sseOpen = true; stopPolling(); });
+    es.addEventListener("metric", e => {
+      try {
+        append([JSON.parse(e.data)]);
+        refreshEmptyState();
+        status.textContent = `${cursor} bytes consumed (live) · ${new Date().toLocaleTimeString()}`;
+      } catch (_) {}
+    });
+    es.addEventListener("cursor", e => { cursor = Number(e.data) || cursor; });
+    es.addEventListener("error", () => {
+      es.close();
+      startPolling();  // resume polling on stream error
+      status.textContent = "stream lost; polling";
+    });
+  });
 
   // ----- action buttons -----
   const btnTags = document.getElementById("btn-edit-tags");

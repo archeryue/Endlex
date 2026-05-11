@@ -240,6 +240,27 @@ def test_dashboard_compare_button_navigates(live_server, tmp_path: Path, page: P
     expect(page).to_have_url(re.compile(r"/compare\?runs="))
 
 
+def test_run_page_upgrades_to_sse(live_server, tmp_path: Path, page: Page):
+    """After the initial bulk poll, the page upgrades to an EventSource and
+    the status text picks up the (live) suffix."""
+    url, _ = live_server
+    _seed(url, tmp_path, name="live")
+    page.goto(f"{url}/run/live")
+    # Initial poll lands first ("bytes consumed · updated …").
+    expect(page.locator("#status")).to_contain_text("bytes consumed", timeout=10_000)
+    # Once SSE attaches and an event arrives, the suffix flips to "(live)".
+    # If the stream attaches before any new event, the suffix never appears
+    # — push one more metric to guarantee a tick.
+    import httpx
+    with httpx.Client(base_url=url) as c:
+        c.post(
+            "/api/runs/live/metrics",
+            json=[{"step": 999, "train/loss": 0.1}],
+            headers={"Authorization": "Bearer e2e-tok"},
+        )
+    expect(page.locator("#status")).to_contain_text("(live)", timeout=10_000)
+
+
 def test_run_page_archive_button_works(live_server, tmp_path: Path, page: Page):
     url, _ = live_server
     _seed(url, tmp_path, name="r")

@@ -12,6 +12,9 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Annotated, Any
 
+import asyncio
+import json as _json
+
 from fastapi import (
     Depends,
     FastAPI,
@@ -21,7 +24,12 @@ from fastapi import (
     Response,
     UploadFile,
 )
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    StreamingResponse,
+)
 from fastapi.templating import Jinja2Templates
 
 from endlex.server.auth import require_read_auth, require_write_auth
@@ -208,6 +216,56 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 — long but flat
     ):
         events, new_offset = storage.read_metrics(name, since_offset=since)
         return {"events": events, "offset": new_offset}
+
+    @app.get(
+        "/api/runs/{name}/metrics/stream",
+        dependencies=[Depends(require_read_auth)],
+    )
+    async def stream_metrics(
+        request: Request,
+        name: str,
+        storage: StorageDep,
+        since: int = Query(default=0, ge=0),
+        poll_interval: float = Query(default=0.5, ge=0.05, le=5.0),
+    ):
+        # Validate up front so a typo doesn't return a 200 SSE that errors mid-stream.
+        if not storage.run_exists(name):
+            raise RunNotFound(name)
+
+        async def gen():
+            cursor = since
+            yield b": stream open\n\n"
+            last_keepalive = asyncio.get_event_loop().time()
+            while True:
+                if await request.is_disconnected():
+                    return
+                # Run sync file IO off the event loop to avoid blocking peers.
+                events, new_cursor = await asyncio.to_thread(
+                    storage.read_metrics, name, since_offset=cursor
+                )
+                for e in events:
+                    yield (
+                        b"event: metric\ndata: "
+                        + _json.dumps(e, separators=(",", ":")).encode()
+                        + b"\n\n"
+                    )
+                if new_cursor != cursor:
+                    cursor = new_cursor
+                    yield f"event: cursor\ndata: {cursor}\n\n".encode()
+                now = asyncio.get_event_loop().time()
+                if now - last_keepalive > 30:
+                    yield b": keep-alive\n\n"
+                    last_keepalive = now
+                await asyncio.sleep(poll_interval)
+
+        return StreamingResponse(
+            gen(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",  # tell nginx not to buffer the stream
+            },
+        )
 
     @app.get(
         "/api/runs/{name}/ckpt/{step}/{filename}",

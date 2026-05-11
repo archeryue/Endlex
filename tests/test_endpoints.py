@@ -295,3 +295,7 @@ def test_admin_prune_all_endpoint(client):
 def test_admin_prune_requires_auth(client):
     r = client.post("/api/admin/prune")
     assert r.status_code == 401
+
+
+# SSE stream tests live in test_e2e.py — TestClient buffers ASGI
+# streaming responses too eagerly to assert on event timing.
