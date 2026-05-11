@@ -137,11 +137,28 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 — long but flat
         storage.delete_run(name)
         return Response(status_code=204)
 
+    @app.patch(
+        "/api/runs/{name}/state",
+        dependencies=[Depends(require_write_auth)],
+    )
+    async def patch_state(
+        name: str,
+        patch: dict[str, Any],
+        storage: StorageDep,
+    ):
+        return storage.update_state(name, patch)
+
     # ---------- reads (JSON) ----------
 
     @app.get("/api/runs", dependencies=[Depends(require_read_auth)])
-    async def list_runs(storage: StorageDep):
-        return [asdict(s) for s in storage.list_runs()]
+    async def list_runs(
+        storage: StorageDep,
+        include_archived: bool = Query(default=False),
+    ):
+        rows = storage.list_runs()
+        if not include_archived:
+            rows = [r for r in rows if not r.archived]
+        return [asdict(r) for r in rows]
 
     @app.get("/api/runs/{name}", dependencies=[Depends(require_read_auth)])
     async def get_run(name: str, storage: StorageDep):
@@ -187,6 +204,9 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 — long but flat
         dependencies=[Depends(require_read_auth)],
     )
     async def dashboard(request: Request, storage: StorageDep):
+        # Always return all runs; the page JS hides archived rows by
+        # default with a toggle so users can re-show them without a
+        # server round-trip.
         runs = [asdict(s) for s in storage.list_runs()]
         return _templates_of(request).TemplateResponse(
             request, "dashboard.html", {"runs": runs}

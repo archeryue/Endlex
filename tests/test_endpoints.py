@@ -175,3 +175,39 @@ def test_html_run_page_renders(client):
 def test_html_run_page_missing_run_is_404(client):
     r = client.get("/run/ghost")
     assert r.status_code == 404
+
+
+# ---------- state ----------
+
+def test_patch_state_updates_tags(client):
+    _init(client, "r")
+    r = client.patch(
+        "/api/runs/r/state",
+        json={"tags": ["best", "exp-1"]},
+        headers=AUTH,
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["tags"] == ["best", "exp-1"]
+    assert client.get("/api/runs/r").json()["summary"]["tags"] == ["best", "exp-1"]
+
+
+def test_patch_state_archives_and_filters(client):
+    _init(client, "keep")
+    _init(client, "hidden")
+    client.patch("/api/runs/hidden/state", json={"archived": True}, headers=AUTH)
+    names = {r["name"] for r in client.get("/api/runs").json()}
+    assert names == {"keep"}
+    names = {r["name"] for r in client.get("/api/runs?include_archived=true").json()}
+    assert names == {"keep", "hidden"}
+
+
+def test_patch_state_requires_auth(client):
+    _init(client, "r")
+    r = client.patch("/api/runs/r/state", json={"archived": True})
+    assert r.status_code == 401
+
+
+def test_patch_state_missing_run(client):
+    r = client.patch("/api/runs/ghost/state", json={"archived": True}, headers=AUTH)
+    assert r.status_code == 404

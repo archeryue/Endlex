@@ -116,6 +116,48 @@ def test_dashboard_lists_runs(live_server, tmp_path: Path, page: Page):
     expect(page).to_have_url(re.compile(r"/run/alpha$"))
 
 
+def test_dashboard_filters_archived(live_server, tmp_path: Path, page: Page):
+    url, _ = live_server
+    _seed(url, tmp_path, name="keep")
+    _seed(url, tmp_path, name="hidden")
+    # Archive one run via the API (server fixture exports ENDLEX_TOKEN=e2e-tok).
+    import httpx
+    with httpx.Client(base_url=url) as c:
+        r = c.patch(
+            "/api/runs/hidden/state",
+            json={"archived": True, "tags": ["wip"]},
+            headers={"Authorization": "Bearer e2e-tok"},
+        )
+        assert r.status_code == 200
+
+    page.goto(url)
+    # By default, archived rows are hidden.
+    visible = page.locator("tbody tr:visible")
+    expect(visible).to_have_count(1)
+    expect(visible.first.locator("a")).to_have_text("keep")
+
+    # Toggle: now both should show.
+    page.locator("#show-archived").check()
+    expect(page.locator("tbody tr:visible")).to_have_count(2)
+    # And the archived row carries the chip.
+    archived_row = page.locator('tbody tr[data-name="hidden"]')
+    expect(archived_row.locator(".chip.archived")).to_be_visible()
+    # And the tags chip.
+    expect(archived_row.locator(".chip", has_text="wip")).to_be_visible()
+
+
+def test_run_page_archive_button_works(live_server, tmp_path: Path, page: Page):
+    url, _ = live_server
+    _seed(url, tmp_path, name="r")
+    # Seed the saved token so the in-page authedFetch doesn't prompt.
+    page.add_init_script("localStorage.setItem('endlex_token', 'e2e-tok')")
+    page.goto(f"{url}/run/r")
+    expect(page.locator("#btn-archive")).to_have_text("Archive")
+    page.locator("#btn-archive").click()
+    # Page reloads after success; new label should read "Unarchive".
+    expect(page.locator("#btn-archive")).to_have_text("Unarchive", timeout=5000)
+
+
 def test_dashboard_dark_mode(live_server, tmp_path: Path, browser):
     """Sanity-check that the dark-mode palette renders without breaking layout."""
     url, _ = live_server

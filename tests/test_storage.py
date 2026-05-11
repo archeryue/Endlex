@@ -133,3 +133,52 @@ def test_checkpoint_rejects_path_traversal(store: Storage):
 def test_checkpoint_requires_existing_run(store: Storage):
     with pytest.raises(RunNotFound):
         store.write_checkpoint_file("ghost", 1000, "model.pt", io.BytesIO(b"x"))
+
+
+# ---------- state (tags + archived) ----------
+
+def test_get_state_defaults(store: Storage):
+    store.init_run("r", {})
+    assert store.get_state("r") == {"tags": [], "archived": False}
+
+
+def test_update_state_persists_tags(store: Storage):
+    store.init_run("r", {})
+    state = store.update_state("r", {"tags": ["foo", "bar"]})
+    assert state["tags"] == ["foo", "bar"]
+    assert store.get_state("r")["tags"] == ["foo", "bar"]
+
+
+def test_update_state_dedupes_and_strips_tags(store: Storage):
+    store.init_run("r", {})
+    state = store.update_state("r", {"tags": [" foo ", "foo", "bar", "", "  "]})
+    assert state["tags"] == ["foo", "bar"]
+
+
+def test_update_state_archive(store: Storage):
+    store.init_run("r", {})
+    assert store.update_state("r", {"archived": True})["archived"] is True
+    assert store.get_state("r")["archived"] is True
+    assert store.update_state("r", {"archived": False})["archived"] is False
+
+
+def test_update_state_rejects_non_string_tags(store: Storage):
+    store.init_run("r", {})
+    from endlex.server.storage import InvalidName
+    with pytest.raises(InvalidName):
+        store.update_state("r", {"tags": ["ok", 123]})
+
+
+def test_state_appears_in_summary(store: Storage):
+    store.init_run("r", {})
+    store.update_state("r", {"tags": ["good"], "archived": True})
+    s = store.summarize_run("r")
+    assert s.tags == ["good"]
+    assert s.archived is True
+
+
+def test_state_missing_run_raises(store: Storage):
+    with pytest.raises(RunNotFound):
+        store.get_state("ghost")
+    with pytest.raises(RunNotFound):
+        store.update_state("ghost", {"archived": True})

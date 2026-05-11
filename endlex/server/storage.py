@@ -47,6 +47,11 @@ class RunSummary:
     last_updated: float | None
     num_events: int
     latest: dict[str, Any] | None
+    tags: list[str]
+    archived: bool
+
+
+_DEFAULT_STATE = {"tags": [], "archived": False}
 
 
 def _validate_name(name: str) -> None:
@@ -208,12 +213,66 @@ class Storage:
                         latest = None
         elif cfg_path.exists():
             last_updated = cfg_path.stat().st_mtime
+        state = self._read_state(run_dir)
         return RunSummary(
             name=name,
             last_updated=last_updated,
             num_events=num_events,
             latest=latest,
+            tags=list(state["tags"]),
+            archived=bool(state["archived"]),
         )
+
+    @staticmethod
+    def _read_state(run_dir: Path) -> dict[str, Any]:
+        state_path = run_dir / "state.json"
+        if not state_path.exists():
+            return dict(_DEFAULT_STATE)
+        try:
+            raw = json.loads(state_path.read_text())
+        except json.JSONDecodeError:
+            return dict(_DEFAULT_STATE)
+        return {
+            "tags": list(raw.get("tags") or []),
+            "archived": bool(raw.get("archived", False)),
+        }
+
+    # ----- state (tags / archived) -----
+
+    def get_state(self, name: str) -> dict[str, Any]:
+        _validate_name(name)
+        run_dir = self.runs_dir / name
+        if not run_dir.is_dir():
+            raise RunNotFound(name)
+        return self._read_state(run_dir)
+
+    def update_state(
+        self, name: str, patch: dict[str, Any]
+    ) -> dict[str, Any]:
+        _validate_name(name)
+        run_dir = self.runs_dir / name
+        if not run_dir.is_dir():
+            raise RunNotFound(name)
+        state = self._read_state(run_dir)
+        if "tags" in patch:
+            tags = patch["tags"]
+            if not isinstance(tags, list) or not all(
+                isinstance(t, str) for t in tags
+            ):
+                raise InvalidName("tags must be a list of strings")
+            # Strip + dedupe while preserving order.
+            seen: dict[str, None] = {}
+            for t in tags:
+                t = t.strip()
+                if t and t not in seen:
+                    seen[t] = None
+            state["tags"] = list(seen)
+        if "archived" in patch:
+            state["archived"] = bool(patch["archived"])
+        (run_dir / "state.json").write_text(
+            json.dumps(state, indent=2, sort_keys=True)
+        )
+        return state
 
     # ----- checkpoints -----
 
