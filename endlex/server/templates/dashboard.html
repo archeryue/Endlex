@@ -1,17 +1,45 @@
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <title>Endlex</title>
-</head>
-<body>
-  <h1>Endlex runs</h1>
-  <ul>
+{% extends "_base.html" %}
+{% block title %}Endlex{% endblock %}
+{% block body %}
+<h1>Runs</h1>
+{% if runs %}
+<table>
+  <thead>
+    <tr>
+      <th>Name</th>
+      <th>Last updated</th>
+      <th>Events</th>
+      <th>Latest step</th>
+      <th>train/loss</th>
+      <th>val/bpb</th>
+    </tr>
+  </thead>
+  <tbody>
     {% for run in runs %}
-      <li><a href="/run/{{ run.name }}">{{ run.name }}</a> &mdash; {{ run.num_events }} events</li>
-    {% else %}
-      <li><em>no runs yet</em></li>
+    <tr>
+      <td><a href="/run/{{ run.name }}">{{ run.name }}</a></td>
+      <td class="muted">
+        {% if run.last_updated %}
+          <span data-ts="{{ run.last_updated }}">{{ run.last_updated|round|int }}</span>
+        {% else %}&mdash;{% endif %}
+      </td>
+      <td>{{ run.num_events }}</td>
+      <td>{% if run.latest and run.latest.step is defined %}{{ run.latest.step }}{% else %}&mdash;{% endif %}</td>
+      <td>{% if run.latest and run.latest["train/loss"] is defined %}{{ "%.4f"|format(run.latest["train/loss"]) }}{% else %}&mdash;{% endif %}</td>
+      <td>{% if run.latest and run.latest["val/bpb"] is defined %}{{ "%.4f"|format(run.latest["val/bpb"]) }}{% else %}&mdash;{% endif %}</td>
+    </tr>
     {% endfor %}
-  </ul>
-</body>
-</html>
+  </tbody>
+</table>
+{% else %}
+<p class="muted">No runs yet. POST to <code>/api/runs/&lt;name&gt;/init</code> to start one.</p>
+{% endif %}
+<script>
+  // Replace epoch seconds with locale time.
+  document.querySelectorAll("[data-ts]").forEach(el => {
+    const t = parseFloat(el.dataset.ts) * 1000;
+    if (!Number.isFinite(t)) return;
+    el.textContent = new Date(t).toLocaleString();
+  });
+</script>
+{% endblock %}

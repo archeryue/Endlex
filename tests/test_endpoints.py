@@ -148,15 +148,30 @@ def test_list_runs(client):
 
 def test_html_dashboard_renders(client):
     _init(client, "r1")
+    client.post(
+        "/api/runs/r1/metrics",
+        json=[{"step": 5, "train/loss": 1.234, "val/bpb": 0.987}],
+        headers=AUTH,
+    )
     r = client.get("/")
     assert r.status_code == 200
     assert "r1" in r.text
-    assert "Endlex" in r.text
+    assert "train/loss" in r.text
+    assert "1.2340" in r.text  # latest train/loss formatted
 
 
 def test_html_run_page_renders(client):
     _init(client, "r", {"lr": 1e-4})
     r = client.get("/run/r")
     assert r.status_code == 200
-    assert "r" in r.text
-    assert "1e-4" in r.text or "0.0001" in r.text
+    # config visible
+    assert "0.0001" in r.text
+    # chart.js loaded + panel scaffolding
+    assert "chart.umd.min.js" in r.text
+    assert 'id="charts"' in r.text
+    assert "train/loss vs step" in r.text
+
+
+def test_html_run_page_missing_run_is_404(client):
+    r = client.get("/run/ghost")
+    assert r.status_code == 404

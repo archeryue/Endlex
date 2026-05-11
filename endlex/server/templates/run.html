@@ -1,20 +1,114 @@
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <title>{{ name }} &mdash; Endlex</title>
-</head>
-<body>
-  <h1>{{ name }}</h1>
-  <h2>Config</h2>
+{% extends "_base.html" %}
+{% block title %}{{ name }} — Endlex{% endblock %}
+{% block head %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.6/dist/chart.umd.min.js"></script>
+{% endblock %}
+{% block body %}
+<h1>{{ name }} <span class="muted" style="font-weight:400;font-size:.9rem;">({{ summary.num_events }} events)</span></h1>
+
+<details>
+  <summary>Config</summary>
   <pre>{{ config | tojson(indent=2) }}</pre>
-  <h2>Checkpoints</h2>
-  <ul>
-    {% for ck in checkpoints %}
-      <li>{{ ck.step }}: {{ ck.files | join(", ") }}</li>
-    {% else %}
-      <li><em>none</em></li>
+</details>
+
+<h2>Charts</h2>
+<div id="charts" class="grid"></div>
+<p id="status" class="muted" style="margin-top:1rem;">loading…</p>
+
+<h2>Checkpoints</h2>
+{% if checkpoints %}
+<ul>
+  {% for ck in checkpoints %}
+  <li><code>{{ ck.step }}</code>:
+    {% for f in ck.files %}
+      <a href="/api/runs/{{ name }}/ckpt/{{ ck.step.replace('step_', '')|int }}/{{ f }}">{{ f }}</a>{% if not loop.last %}, {% endif %}
     {% endfor %}
-  </ul>
-</body>
-</html>
+  </li>
+  {% endfor %}
+</ul>
+{% else %}
+<p class="muted">No checkpoints uploaded.</p>
+{% endif %}
+
+<script>
+(() => {
+  const RUN = {{ name | tojson }};
+
+  // [title, x-key, y-key]
+  const PANELS = [
+    ["train/loss vs step",          "step", "train/loss"],
+    ["val/bpb vs step",             "step", "val/bpb"],
+    ["val/bpb vs total_time",       "total_training_time",  "val/bpb"],
+    ["val/bpb vs total_flops",      "total_training_flops", "val/bpb"],
+    ["train/mfu vs step",           "step", "train/mfu"],
+    ["train/dt vs step",            "step", "train/dt"],
+    ["train/tok_per_sec vs step",   "step", "train/tok_per_sec"],
+    ["train/lrm vs step",           "step", "train/lrm"],
+  ];
+
+  const root = document.getElementById("charts");
+  const status = document.getElementById("status");
+  const charts = {};
+  let cursor = 0;
+
+  function ensureChart(idx) {
+    if (charts[idx]) return charts[idx];
+    const [title, xk, yk] = PANELS[idx];
+    const wrap = document.createElement("section");
+    wrap.className = "panel";
+    wrap.innerHTML = `<h3>${title}</h3><canvas id="chart-${idx}" height="220"></canvas>`;
+    root.appendChild(wrap);
+    const ctx = wrap.querySelector("canvas").getContext("2d");
+    charts[idx] = new Chart(ctx, {
+      type: "line",
+      data: { datasets: [{
+        data: [],
+        borderColor: getComputedStyle(document.documentElement).getPropertyValue("--accent") || "#2050b3",
+        borderWidth: 1.5,
+        pointRadius: 0,
+        showLine: true,
+      }] },
+      options: {
+        responsive: true,
+        animation: false,
+        parsing: false,
+        scales: {
+          x: { type: "linear", title: { display: true, text: xk } },
+          y: { title: { display: true, text: yk } },
+        },
+        plugins: { legend: { display: false } },
+      },
+    });
+    return charts[idx];
+  }
+
+  function append(events) {
+    if (!events.length) return;
+    for (const e of events) {
+      PANELS.forEach(([_, xk, yk], idx) => {
+        if (e[xk] == null || e[yk] == null) return;
+        const ch = ensureChart(idx);
+        ch.data.datasets[0].data.push({ x: Number(e[xk]), y: Number(e[yk]) });
+      });
+    }
+    Object.values(charts).forEach(c => c.update("none"));
+  }
+
+  async function poll() {
+    try {
+      const r = await fetch(`/api/runs/${encodeURIComponent(RUN)}/metrics?since=${cursor}`);
+      if (!r.ok) { status.textContent = `error: HTTP ${r.status}`; return; }
+      const body = await r.json();
+      cursor = body.offset;
+      append(body.events);
+      status.textContent = `${cursor} bytes consumed · updated ${new Date().toLocaleTimeString()}`;
+    } catch (e) {
+      status.textContent = `error: ${e.message}`;
+    }
+  }
+
+  poll();
+  setInterval(poll, 5000);
+})();
+</script>
+{% endblock %}
