@@ -196,6 +196,64 @@ def test_update_state_rejects_bad_panels(store: Storage, bad_panel):
         store.update_state("r", {"panels": bad_panel})
 
 
+def test_panel_accepts_axis_range_overrides(store: Storage):
+    store.init_run("r", {})
+    store.update_state(
+        "r",
+        {
+            "panels": [
+                {
+                    "title": "zoomed loss",
+                    "x": "step",
+                    "y": "train/loss",
+                    "xmin": 100,
+                    "xmax": 1000,
+                    "ymin": 0,
+                    "ymax": 5.5,
+                }
+            ]
+        },
+    )
+    p = store.get_state("r")["panels"][0]
+    assert p["xmin"] == 100.0
+    assert p["xmax"] == 1000.0
+    assert p["ymin"] == 0.0
+    assert p["ymax"] == 5.5
+
+
+def test_panel_axis_range_blank_or_none_omitted(store: Storage):
+    """Empty-string and None inputs from the UI mean "auto-scale" — don't persist."""
+    store.init_run("r", {})
+    store.update_state(
+        "r",
+        {
+            "panels": [
+                {
+                    "title": "t",
+                    "x": "step",
+                    "y": "v",
+                    "xmin": "",
+                    "xmax": None,
+                    "ymin": 2.0,
+                }
+            ]
+        },
+    )
+    p = store.get_state("r")["panels"][0]
+    assert "xmin" not in p
+    assert "xmax" not in p
+    assert p["ymin"] == 2.0
+
+
+def test_panel_rejects_non_numeric_axis_range(store: Storage):
+    store.init_run("r", {})
+    with pytest.raises(InvalidName):
+        store.update_state(
+            "r",
+            {"panels": [{"title": "t", "x": "step", "y": "v", "xmin": "abc"}]},
+        )
+
+
 def test_update_state_persists_notes(store: Storage):
     store.init_run("r", {})
     store.update_state("r", {"notes": "this is the one that almost worked"})

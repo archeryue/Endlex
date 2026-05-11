@@ -416,7 +416,7 @@ class Storage:
             panels = patch["panels"]
             if not isinstance(panels, list):
                 raise InvalidName("panels must be a list")
-            normalized_panels: list[dict[str, str]] = []
+            normalized_panels: list[dict[str, Any]] = []
             for p in panels:
                 if not isinstance(p, dict):
                     raise InvalidName("each panel must be an object")
@@ -425,9 +425,21 @@ class Storage:
                         raise InvalidName(
                             f"panel missing non-empty string field: {key}"
                         )
-                normalized_panels.append(
-                    {"title": p["title"], "x": p["x"], "y": p["y"]}
-                )
+                norm: dict[str, Any] = {
+                    "title": p["title"],
+                    "x": p["x"],
+                    "y": p["y"],
+                }
+                # Optional axis-range overrides. None / missing => auto-scale.
+                for key in ("xmin", "xmax", "ymin", "ymax"):
+                    if key in p and p[key] is not None and p[key] != "":
+                        try:
+                            norm[key] = float(p[key])
+                        except (TypeError, ValueError) as e:
+                            raise InvalidName(
+                                f"panel.{key} must be numeric, got {p[key]!r}"
+                            ) from e
+                normalized_panels.append(norm)
             state["panels"] = normalized_panels
         (run_dir / "state.json").write_text(
             json.dumps(state, indent=2, sort_keys=True)

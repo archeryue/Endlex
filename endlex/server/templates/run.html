@@ -116,22 +116,21 @@
   const RUN = {{ name | tojson }};
 
   // Default panel definitions — used when state.panels is empty (the run
-  // hasn't been customized). Format: [title, x-key, y-key].
+  // hasn't been customized). Each entry is {title, x, y, xmin?, xmax?,
+  // ymin?, ymax?}; the axis-range fields override Chart.js's auto-scaling.
   const DEFAULT_PANELS = [
-    ["train/loss vs step",          "step", "train/loss"],
-    ["val/bpb vs step",             "step", "val/bpb"],
-    ["val/bpb vs total_time",       "total_training_time",  "val/bpb"],
-    ["val/bpb vs total_flops",      "total_training_flops", "val/bpb"],
-    ["train/mfu vs step",           "step", "train/mfu"],
-    ["train/dt vs step",            "step", "train/dt"],
-    ["train/tok_per_sec vs step",   "step", "train/tok_per_sec"],
-    ["train/lrm vs step",           "step", "train/lrm"],
+    {title: "train/loss vs step",          x: "step", y: "train/loss"},
+    {title: "val/bpb vs step",             x: "step", y: "val/bpb"},
+    {title: "val/bpb vs total_time",       x: "total_training_time",  y: "val/bpb"},
+    {title: "val/bpb vs total_flops",      x: "total_training_flops", y: "val/bpb"},
+    {title: "train/mfu vs step",           x: "step", y: "train/mfu"},
+    {title: "train/dt vs step",            x: "step", y: "train/dt"},
+    {title: "train/tok_per_sec vs step",   x: "step", y: "train/tok_per_sec"},
+    {title: "train/lrm vs step",           x: "step", y: "train/lrm"},
   ];
   // state.panels is the user's customization; if empty, defaults are used.
   const userPanels = {{ state.panels | tojson }};
-  let PANELS = userPanels.length
-    ? userPanels.map(p => [p.title, p.x, p.y])
-    : DEFAULT_PANELS;
+  let PANELS = userPanels.length ? userPanels.slice() : DEFAULT_PANELS.slice();
 
   const root = document.getElementById("charts");
   const emptyHint = document.getElementById("charts-empty");
@@ -154,20 +153,53 @@
     getComputedStyle(document.documentElement).getPropertyValue("--muted").trim() ||
     "#666";
 
+  function escapeAttr(s) {
+    return String(s).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+  }
+
   function ensureChart(idx) {
     if (charts[idx]) return charts[idx];
-    const [title, xk, yk] = PANELS[idx];
+    const {title, x: xk, y: yk, xmin, xmax, ymin, ymax} = PANELS[idx];
+    const btnStyle = "padding:0 .35rem;line-height:1;background:transparent;border:none;color:var(--muted);cursor:pointer;font-size:1rem;";
     const wrap = document.createElement("section");
     wrap.className = "panel";
     wrap.style.position = "relative";
     wrap.dataset.panelIdx = String(idx);
     wrap.innerHTML = `
-      <button class="panel-remove" data-idx="${idx}" title="remove panel"
-              style="position:absolute;top:.45rem;right:.5rem;padding:0 .35rem;line-height:1;background:transparent;border:none;color:var(--muted);cursor:pointer;font-size:1.1rem;">×</button>
-      <h3 style="padding-right:1.25rem;">${title}</h3>
+      <span style="position:absolute;top:.4rem;right:.5rem;display:inline-flex;gap:.1rem;">
+        <button class="panel-edit"   data-idx="${idx}" title="edit panel"   style="${btnStyle}">✎</button>
+        <button class="panel-remove" data-idx="${idx}" title="remove panel" style="${btnStyle}font-size:1.1rem;">×</button>
+      </span>
+      <h3 style="padding-right:2.75rem;">${escapeAttr(title)}</h3>
       <canvas id="chart-${idx}" height="220"></canvas>
+      <div class="panel-edit-form" hidden style="display:flex;flex-direction:column;gap:.3rem;margin-top:.5rem;padding-top:.5rem;border-top:1px dashed var(--border);">
+        <input class="pe-title" placeholder="title" value="${escapeAttr(title)}" />
+        <input class="pe-x" list="key-suggestions" placeholder="x key" value="${escapeAttr(xk)}" autocomplete="off" />
+        <input class="pe-y" list="key-suggestions" placeholder="y key" value="${escapeAttr(yk)}" autocomplete="off" />
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:.3rem;">
+          <input class="pe-xmin" type="number" step="any" placeholder="x min (auto)" value="${xmin ?? ""}" />
+          <input class="pe-xmax" type="number" step="any" placeholder="x max (auto)" value="${xmax ?? ""}" />
+          <input class="pe-ymin" type="number" step="any" placeholder="y min (auto)" value="${ymin ?? ""}" />
+          <input class="pe-ymax" type="number" step="any" placeholder="y max (auto)" value="${ymax ?? ""}" />
+        </div>
+        <div style="display:flex;gap:.4rem;">
+          <button class="pe-save primary">Save</button>
+          <button class="pe-cancel">Cancel</button>
+        </div>
+        <span class="pe-status muted" style="font-size:.8rem;"></span>
+      </div>
     `;
     root.appendChild(wrap);
+    const form = wrap.querySelector(".panel-edit-form");
+    wrap.querySelector(".panel-edit").addEventListener("click", () => {
+      form.hidden = !form.hidden;
+    });
+    wrap.querySelector(".pe-cancel").addEventListener("click", () => {
+      form.hidden = true;
+    });
+    wrap.querySelector(".pe-save").addEventListener(
+      "click", () => savePanelEdit(idx, wrap)
+    );
     wrap.querySelector(".panel-remove").addEventListener("click", () =>
       removePanel(idx)
     );
@@ -192,11 +224,15 @@
             title: { display: true, text: xk, color: muted, font: { size: 11 } },
             ticks: { color: muted, font: { size: 10 }, maxRotation: 0, autoSkipPadding: 16 },
             grid: { color: grid },
+            ...(xmin != null ? { min: xmin } : {}),
+            ...(xmax != null ? { max: xmax } : {}),
           },
           y: {
             title: { display: true, text: yk, color: muted, font: { size: 11 } },
             ticks: { color: muted, font: { size: 10 }, padding: 4 },
             grid: { color: grid },
+            ...(ymin != null ? { min: ymin } : {}),
+            ...(ymax != null ? { max: ymax } : {}),
           },
         },
         plugins: { legend: { display: false } },
@@ -209,7 +245,8 @@
     if (!events.length) return;
     for (const e of events) allEvents.push(e);
     for (const e of events) {
-      PANELS.forEach(([_, xk, yk], idx) => {
+      PANELS.forEach((panel, idx) => {
+        const {x: xk, y: yk} = panel;
         if (e[xk] == null || e[yk] == null) return;
         const ch = ensureChart(idx);
         ch.data.datasets[0].data.push({ x: Number(e[xk]), y: Number(e[yk]) });
@@ -256,10 +293,36 @@
   }
 
   function effectivePanels() {
-    // What we should persist on the server: if the user has touched the list
-    // at all, send their explicit choices. Otherwise leave it empty so the
-    // run keeps following the defaults if those evolve later.
-    return PANELS.map(([title, x, y]) => ({title, x, y}));
+    // Persist the current panel list exactly. PANELS already holds objects
+    // with optional xmin/xmax/ymin/ymax — pass them straight through.
+    return PANELS.map(p => ({...p}));
+  }
+
+  async function savePanelEdit(idx, wrap) {
+    const get = sel => wrap.querySelector(sel).value;
+    const num = sel => {
+      const v = wrap.querySelector(sel).value.trim();
+      return v === "" ? null : Number(v);
+    };
+    const title = get(".pe-title").trim();
+    const x = get(".pe-x").trim();
+    const y = get(".pe-y").trim();
+    const statusEl = wrap.querySelector(".pe-status");
+    if (!title || !x || !y) {
+      statusEl.textContent = "title, x, y all required";
+      return;
+    }
+    const next = effectivePanels();
+    const updated = {title, x, y};
+    for (const k of ["xmin", "xmax", "ymin", "ymax"]) {
+      const v = num(`.pe-${k}`);
+      if (v != null && Number.isFinite(v)) updated[k] = v;
+    }
+    next[idx] = updated;
+    try {
+      await savePanels(next);
+      location.reload();
+    } catch (e) { statusEl.textContent = `error: ${e.message}`; }
   }
 
   async function savePanels(panels) {

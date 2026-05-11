@@ -376,6 +376,59 @@ def test_run_page_add_and_remove_custom_panel(
     ).to_have_count(0, timeout=10_000)
 
 
+def test_run_page_edit_panel_axis_range(live_server, tmp_path: Path, page: Page):
+    """Edit a default panel's x-axis to start at 50, save, verify the chart
+    actually picks up the new minimum."""
+    url, _ = live_server
+    # Seed with train/loss across a wide step range so we can crop.
+    import httpx
+    with httpx.Client(base_url=url) as c:
+        c.post(
+            "/api/runs/r/init", json={}, headers={"Authorization": "Bearer e2e-tok"}
+        )
+        c.post(
+            "/api/runs/r/metrics",
+            json=[{"step": s, "train/loss": 10 - 0.05 * s} for s in range(100)],
+            headers={"Authorization": "Bearer e2e-tok"},
+        )
+
+    page.add_init_script("localStorage.setItem('endlex_token', 'e2e-tok')")
+    page.goto(f"{url}/run/r")
+    loss_panel = page.locator("#charts .panel", has_text="train/loss vs step").first
+    expect(loss_panel).to_be_visible(timeout=10_000)
+
+    # Open the edit form and set xmin=50.
+    loss_panel.locator(".panel-edit").click()
+    expect(loss_panel.locator(".panel-edit-form")).to_be_visible()
+    loss_panel.locator(".pe-xmin").fill("50")
+    loss_panel.locator(".pe-save").click()
+
+    # After reload, the chart's x-axis option should reflect min=50.
+    loss_panel_2 = page.locator("#charts .panel", has_text="train/loss vs step").first
+    expect(loss_panel_2).to_be_visible(timeout=10_000)
+    # Wait for at least one Chart.js instance to materialize (it only does so
+    # after the first poll() round-trip).
+    page.wait_for_function(
+        """() => {
+          for (const cv of document.querySelectorAll('#charts canvas')) {
+            if (Chart.getChart(cv)) return true;
+          }
+          return false;
+        }""",
+        timeout=10_000,
+    )
+    xmin = page.evaluate(
+        """() => {
+          for (const cv of document.querySelectorAll('#charts canvas')) {
+            const ch = Chart.getChart(cv);
+            if (ch && ch.options.scales.x.min === 50) return 50;
+          }
+          return null;
+        }"""
+    )
+    assert xmin == 50, "no panel ended up with x-axis min=50 after save+reload"
+
+
 def test_run_page_notes_edit_persists(live_server, tmp_path: Path, page: Page):
     """Type notes, save, reload — they should still be there."""
     url, _ = live_server
