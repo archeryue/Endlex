@@ -6,6 +6,16 @@ Initially built as the observability layer for ArcherChat (a from-scratch nanoch
 
 ![dashboard](docs/screenshots/dashboard.png)
 
+## How it works
+
+The mental model is one sentence: **the cloud trainer's local JSONL is the source of truth; the server is a real-time mirror.**
+
+- `tracker.log()` writes a line-buffered (kill-9-safe) append to local disk, then pushes onto a bounded in-memory queue. Returns in <100 µs.
+- A daemon thread drains the queue and POSTs batches to the server. Bounded queue → drop-oldest under sustained backpressure. Retries with exponential backoff on 5xx + transport errors.
+- A second daemon thread handles checkpoint uploads, so multi-GB transfers can't starve low-latency metric flushes.
+- Network glitch? Training keeps going. When the cloud trainer restarts, the next `Tracker(...)` automatically resyncs any gap from the local JSONL to the server.
+- When training finishes, your final weights are already on the home box. Tear down the cloud GPU instance — everything downstream (`chat_cli`, eval, inference) runs against the local file system.
+
 ## Features
 
 **Server**
@@ -77,6 +87,12 @@ tracker.finish()
 ```
 
 That's it. No team/sweep ceremony, no quotas, no daemon to install.
+
+### Maintenance
+
+- **`GET /health`** — unauthenticated probe returning `{status, version, runs}`. Wire it into your monitoring agent.
+- **`POST /api/admin/prune`** — applies the configured retention policy across every run. Drop this into a cron entry if you've set `ENDLEX_CKPT_KEEP_LAST` or `ENDLEX_CKPT_MAX_AGE_DAYS` (per-run overrides live in `runs/<name>/state.json`).
+- **Backup** — everything lives under `$ENDLEX_DATA/`. Snapshot the directory with whatever tool you already trust.
 
 ## Multi-run comparison
 
