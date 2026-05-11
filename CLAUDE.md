@@ -4,9 +4,33 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repo status
 
-Pre-implementation. The only files are `README.md` (one-paragraph intro) and `TECH_PLAN.md` (the full design). No code, no build/test/lint tooling exists yet. Don't fabricate commands — when the first code lands, update this file with the real ones.
+v1 implemented per `TECH_PLAN.md`. **Read TECH_PLAN.md before changing behavior** — it is the authoritative spec for storage layout, HTTP API, client contract, and the performance rules below. If a request conflicts with it, surface the conflict rather than silently diverging.
 
-**Read `TECH_PLAN.md` before doing any implementation work.** It is the canonical spec: storage layout, HTTP API table, client contract, and the performance rules below. Treat it as authoritative; if a request conflicts with it, surface the conflict rather than silently diverging.
+## Layout
+
+```
+endlex/
+  tracker.py            # client Tracker (hot-path log, daemon batching)
+  checkpoint_sync.py    # upload_checkpoint{,_async} helpers
+  server/
+    app.py              # FastAPI factory `create_app(data_root)`
+    storage.py          # disk layout: runs/, checkpoints/, JSONL append
+    auth.py             # bearer-token dependencies
+    templates/          # dashboard + per-run Chart.js page
+tests/                  # pytest, includes a real-uvicorn e2e
+deploy/                 # systemd unit, nginx snippet, env.example
+```
+
+## Commands
+
+```bash
+uv sync --extra server          # install deps incl. fastapi/uvicorn
+uv run pytest -q                # full suite (~1s, includes a live uvicorn e2e)
+uv run pytest tests/test_tracker.py::test_log_hot_path_under_100us  # perf gate
+uv run endlex-server            # run the server (port 8000 by default)
+```
+
+The cloud trainer should `pip install endlex` (no `--extra server`) — the client deps are just `httpx`.
 
 ## What Endlex is
 

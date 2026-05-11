@@ -1,0 +1,39 @@
+# Systemd unit for Endlex.
+#
+# Install:
+#   sudo install -m 0644 deploy/endlex.service /etc/systemd/system/endlex.service
+#   sudo install -m 0600 -o endlex deploy/endlex.env.example /etc/endlex/env
+#   sudo $EDITOR /etc/endlex/env          # set ENDLEX_TOKEN, ENDLEX_DATA, etc.
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now endlex
+#
+# Adjust User= / WorkingDirectory= / ExecStart= to match where you cloned
+# the repo and how you installed dependencies.
+
+[Unit]
+Description=Endlex telemetry + checkpoint server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=endlex
+Group=endlex
+WorkingDirectory=/srv/endlex
+EnvironmentFile=/etc/endlex/env
+# uv-managed venv:
+ExecStart=/usr/local/bin/uv run --extra server endlex-server
+# Or, plain venv with the [server] extra installed:
+#   ExecStart=/srv/endlex/.venv/bin/endlex-server
+Restart=on-failure
+RestartSec=5s
+
+# Hardening — comment out if it interferes with your $ENDLEX_DATA path.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/endlex
+
+[Install]
+WantedBy=multi-user.target
