@@ -121,6 +121,31 @@
       border: 1px dashed var(--border);
       border-radius: 8px;
     }
+
+    /* Collapsible per-panel edit form and the add-panel form. Hidden by
+       default; .open promotes to a flex column. Using a class instead of
+       the `hidden` attribute because the latter loses to inline display. */
+    .panel-edit-form, .ap-form {
+      display: none;
+      flex-direction: column;
+      gap: .3rem;
+      margin-top: .5rem;
+      padding-top: .5rem;
+      border-top: 1px dashed var(--border);
+    }
+    .panel-edit-form.open, .ap-form.open { display: flex; }
+    .ap-trigger {
+      width: 100%;
+      min-height: 8rem;
+      background: transparent;
+      border: none;
+      cursor: pointer;
+      color: var(--muted);
+      font: inherit;
+      padding: 1rem;
+    }
+    .ap-trigger:hover { background: var(--row-hover); color: var(--accent); }
+    .ap-trigger .plus { display: block; font-size: 1.6rem; line-height: 1; margin-bottom: .35rem; }
   </style>
   {% block head %}{% endblock %}
 </head>

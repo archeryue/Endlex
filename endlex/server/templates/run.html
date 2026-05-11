@@ -172,7 +172,7 @@
       </span>
       <h3 style="padding-right:2.75rem;">${escapeAttr(title)}</h3>
       <canvas id="chart-${idx}" height="220"></canvas>
-      <div class="panel-edit-form" hidden style="display:flex;flex-direction:column;gap:.3rem;margin-top:.5rem;padding-top:.5rem;border-top:1px dashed var(--border);">
+      <div class="panel-edit-form">
         <input class="pe-title" placeholder="title" value="${escapeAttr(title)}" />
         <input class="pe-x" list="key-suggestions" placeholder="x key" value="${escapeAttr(xk)}" autocomplete="off" />
         <input class="pe-y" list="key-suggestions" placeholder="y key" value="${escapeAttr(yk)}" autocomplete="off" />
@@ -192,10 +192,10 @@
     root.appendChild(wrap);
     const form = wrap.querySelector(".panel-edit-form");
     wrap.querySelector(".panel-edit").addEventListener("click", () => {
-      form.hidden = !form.hidden;
+      form.classList.toggle("open");
     });
     wrap.querySelector(".pe-cancel").addEventListener("click", () => {
-      form.hidden = true;
+      form.classList.remove("open");
     });
     wrap.querySelector(".pe-save").addEventListener(
       "click", () => savePanelEdit(idx, wrap)
@@ -268,23 +268,42 @@
       addCardEl = document.createElement("section");
       addCardEl.className = "panel panel-add";
       addCardEl.style.borderStyle = "dashed";
-      addCardEl.style.display = "flex";
-      addCardEl.style.flexDirection = "column";
-      addCardEl.style.alignItems = "stretch";
-      addCardEl.style.justifyContent = "center";
-      addCardEl.style.gap = ".4rem";
+      addCardEl.style.padding = "0";
       addCardEl.innerHTML = `
-        <strong style="font-size:.9rem;color:var(--muted);">Add a panel</strong>
-        <input id="ap-title" placeholder="title (e.g. grad-norm)" autocomplete="off" />
-        <input id="ap-x" list="key-suggestions" placeholder="x key (e.g. step)" autocomplete="off" />
-        <input id="ap-y" list="key-suggestions" placeholder="y key (e.g. train/grad_norm)" autocomplete="off" />
-        <button id="ap-add" class="primary">+ Add panel</button>
-        <span id="ap-status" class="muted" style="font-size:.8rem;"></span>
+        <button class="ap-trigger" title="add a new panel">
+          <span class="plus">+</span>Add panel
+        </button>
+        <div class="ap-form" style="padding: 1rem;">
+          <strong style="font-size:.9rem;color:var(--muted);">New panel</strong>
+          <input class="ap-title" placeholder="title (e.g. grad-norm)" autocomplete="off" />
+          <input class="ap-x" list="key-suggestions" placeholder="x key (e.g. step)" autocomplete="off" />
+          <input class="ap-y" list="key-suggestions" placeholder="y key (e.g. train/grad_norm)" autocomplete="off" />
+          <div style="display:flex;gap:.4rem;">
+            <button class="ap-add primary">Add</button>
+            <button class="ap-cancel">Cancel</button>
+          </div>
+          <span class="ap-status muted" style="font-size:.8rem;"></span>
+        </div>
       `;
       root.appendChild(addCardEl);
-      const $ = id => addCardEl.querySelector(`#${id}`);
-      $("ap-add").addEventListener("click", () => addPanel(
-        $("ap-title").value, $("ap-x").value, $("ap-y").value, $("ap-status")
+      const $ = sel => addCardEl.querySelector(sel);
+      const form = $(".ap-form");
+      const trigger = $(".ap-trigger");
+      trigger.addEventListener("click", () => {
+        form.classList.add("open");
+        trigger.hidden = true;
+        $(".ap-title").focus();
+      });
+      $(".ap-cancel").addEventListener("click", () => {
+        form.classList.remove("open");
+        trigger.hidden = false;
+        $(".ap-title").value = "";
+        $(".ap-x").value = "";
+        $(".ap-y").value = "";
+        $(".ap-status").textContent = "";
+      });
+      $(".ap-add").addEventListener("click", () => addPanel(
+        $(".ap-title").value, $(".ap-x").value, $(".ap-y").value, $(".ap-status")
       ));
     } else {
       // Keep the add card at the end after panels.append re-orders elements.

@@ -354,11 +354,17 @@ def test_run_page_add_and_remove_custom_panel(
         page.locator("#charts .panel", has_text="train/loss vs step")
     ).to_be_visible(timeout=10_000)
 
+    # The add card starts collapsed — only the "+ Add panel" trigger shows.
+    expect(page.locator(".ap-trigger")).to_be_visible()
+    expect(page.locator(".ap-form")).not_to_be_visible()
+    page.locator(".ap-trigger").click()
+    expect(page.locator(".ap-form")).to_be_visible()
+
     # The user adds a panel for the non-default `custom/metric` key.
-    page.locator("#ap-title").fill("custom!")
-    page.locator("#ap-x").fill("step")
-    page.locator("#ap-y").fill("custom/metric")
-    page.locator("#ap-add").click()
+    page.locator(".ap-title").fill("custom!")
+    page.locator(".ap-x").fill("step")
+    page.locator(".ap-y").fill("custom/metric")
+    page.locator(".ap-add").click()
 
     # After reload, the custom panel appears (along with the train/loss one).
     expect(
@@ -397,7 +403,8 @@ def test_run_page_edit_panel_axis_range(live_server, tmp_path: Path, page: Page)
     loss_panel = page.locator("#charts .panel", has_text="train/loss vs step").first
     expect(loss_panel).to_be_visible(timeout=10_000)
 
-    # Open the edit form and set xmin=50.
+    # Edit form is collapsed by default — only the ✎ button is visible.
+    expect(loss_panel.locator(".panel-edit-form")).not_to_be_visible()
     loss_panel.locator(".panel-edit").click()
     expect(loss_panel.locator(".panel-edit-form")).to_be_visible()
     loss_panel.locator(".pe-xmin").fill("50")
