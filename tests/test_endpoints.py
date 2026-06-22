@@ -42,8 +42,18 @@ def test_init_creates_run(client):
     assert r.json()["config"] == {"lr": 1e-4}
 
 
-def test_init_idempotent_same_config(client):
+def test_init_locked_while_active(client):
+    """Second init on an active run returns 409 (concurrent writer guard)."""
     _init(client, "r")
+    r = client.post("/api/runs/r/init", json={"lr": 1e-4}, headers=AUTH)
+    assert r.status_code == 409
+
+
+def test_init_after_finish_allowed(client):
+    """init is allowed again after the run is finished (lock released)."""
+    _init(client, "r")
+    r = client.post("/api/runs/r/finish", headers=AUTH)
+    assert r.status_code == 200
     _init(client, "r")  # no 409
 
 

@@ -30,8 +30,17 @@ def test_init_run_creates_files(store: Storage):
     assert json.loads((run_dir / "config.json").read_text()) == {"lr": 1e-4}
 
 
-def test_init_run_idempotent_with_same_config(store: Storage):
+def test_init_run_locked_while_active(store: Storage):
+    """A second init on an active run raises RunLocked (concurrent-writer guard)."""
     store.init_run("run1", {"lr": 1e-4})
+    with pytest.raises(RunLocked):
+        store.init_run("run1", {"lr": 1e-4})
+
+
+def test_init_run_reinit_after_finish(store: Storage):
+    """finish_run releases the lock; the run can then be re-initialised."""
+    store.init_run("run1", {"lr": 1e-4})
+    store.finish_run("run1")
     store.init_run("run1", {"lr": 1e-4})  # no error
 
 

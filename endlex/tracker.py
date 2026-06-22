@@ -170,6 +170,17 @@ class Tracker:
         if self._thread is not None:
             self._thread.join(timeout=timeout)
         if self._client is not None:
+            # If events were dropped from the remote queue under backpressure
+            # they made it into the local JSONL but never into a batch.
+            # Compare server count to local line count and ship the gap.
+            if self._dropped > 0:
+                self._reconcile_at_finish()
+            # Best-effort: release the server-side lock so a restarted trainer
+            # can re-init this run without needing force=True.
+            try:
+                self._client.post(f"/api/runs/{self.name}/finish")
+            except Exception:
+                pass
             self._client.close()
         try:
             self._local.close()
@@ -368,3 +379,40 @@ class Tracker:
                 self._in_flight = 0
             if not ok:
                 return
+
+    def _reconcile_at_finish(self) -> None:
+        """Ship any events present in local JSONL that the server is missing.
+
+        Called once at finish() after the daemon has drained. Covers events
+        that were dropped from the remote queue under backpressure or whose
+        batches failed all retries — the local file is the source of truth.
+        Uses the same count-based offset as resync; the gap scenario (a middle
+        batch failed while a later one succeeded) can still produce duplicates,
+        but that requires both retry exhaustion and subsequent success — an
+        uncommon combination in practice.
+        """
+        try:
+            r = self._client.get(f"/api/runs/{self.name}")
+            if r.status_code != 200:
+                return
+            server_count = int(r.json().get("summary", {}).get("num_events", 0))
+        except (httpx.HTTPError, ValueError, KeyError, TypeError):
+            return
+        metrics_path = self._dir / "metrics.jsonl"
+        try:
+            with metrics_path.open("rb") as f:
+                lines = [ln for ln in f if ln.strip()]
+        except OSError:
+            return
+        if len(lines) <= server_count:
+            return
+        to_ship: list[dict[str, Any]] = []
+        for raw in lines[server_count:]:
+            try:
+                to_ship.append(json.loads(raw))
+            except json.JSONDecodeError:
+                continue
+        for i in range(0, len(to_ship), self.batch_size):
+            chunk = to_ship[i : i + self.batch_size]
+            if not self._post_batch(chunk):
+                break

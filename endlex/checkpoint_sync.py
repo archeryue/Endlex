@@ -16,6 +16,10 @@ from typing import Mapping
 
 import httpx
 
+# Cap concurrent async uploads so a burst of checkpoints on a slow link
+# doesn't open unbounded parallel TCP streams and file handles.
+_UPLOAD_SEM = threading.Semaphore(4)
+
 
 def upload_checkpoint(
     run_name: str,
@@ -98,8 +102,12 @@ def upload_checkpoint_async(
     **kwargs,
 ) -> threading.Thread:
     """Spawn a daemon thread that uploads the checkpoint; return immediately."""
+    def _upload_with_sem(*args, **kw):
+        with _UPLOAD_SEM:
+            upload_checkpoint(*args, **kw)
+
     t = threading.Thread(
-        target=upload_checkpoint,
+        target=_upload_with_sem,
         args=(run_name, step, files),
         kwargs=kwargs,
         name=f"endlex-ckpt-{run_name}-{step}",

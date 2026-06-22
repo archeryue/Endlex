@@ -42,6 +42,6 @@ def require_write_auth(authorization: str | None = Header(default=None)) -> None
 
 
 def require_read_auth(authorization: str | None = Header(default=None)) -> None:
-    if os.environ.get("ENDLEX_PUBLIC_READS", "1") == "1":
+    if os.environ.get("ENDLEX_PUBLIC_READS", "0") == "1":
         return
     _check_bearer(authorization)

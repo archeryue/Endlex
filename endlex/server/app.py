@@ -184,6 +184,17 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 — long but flat
                 result[s.name] = pruned
         return {"pruned": result}
 
+    @app.post(
+        "/api/runs/{name}/finish",
+        dependencies=[Depends(require_write_auth)],
+    )
+    async def finish_run(name: str, storage: StorageDep):
+        """Release the active-writer lock, allowing the run to be re-initialised."""
+        if not storage.run_exists(name):
+            raise RunNotFound(name)
+        storage.finish_run(name)
+        return {"name": name, "finished": True}
+
     @app.delete(
         "/api/runs/{name}",
         dependencies=[Depends(require_write_auth)],

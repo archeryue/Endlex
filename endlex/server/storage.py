@@ -12,10 +12,12 @@ No DB. JSONL is tail-friendly; rm -rf cleans up.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
 import shutil
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,7 +40,7 @@ class RunNotFound(StorageError):
 
 
 class RunLocked(StorageError):
-    """init called on an existing run whose config differs from what's on disk."""
+    """init called on an already-active run (concurrent writer) or a config conflict."""
 
 
 @dataclass(frozen=True)
@@ -89,6 +91,11 @@ class Storage:
         self.ckpt_dir.mkdir(parents=True, exist_ok=True)
         self.default_keep_last = max(0, int(default_keep_last))
         self.default_max_age_days = max(0.0, float(default_max_age_days))
+        # Tracks open fds holding an exclusive flock on each run's .lock file.
+        # flock within one OS process converts rather than blocks, so we pair
+        # it with this in-memory dict to catch concurrent in-process callers.
+        self._lock_fds: dict[str, int] = {}
+        self._lock_fds_mu = threading.Lock()
 
     # ----- runs -----
 
@@ -99,16 +106,53 @@ class Storage:
         run_dir = self.runs_dir / name
         cfg_path = run_dir / "config.json"
         lock_path = run_dir / ".lock"
-        if run_dir.exists() and lock_path.exists() and not force:
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        with self._lock_fds_mu:
+            in_process_locked = name in self._lock_fds
+            if in_process_locked and not force:
+                raise RunLocked(name)
+
+            # Linux flock treats each open file description as an independent
+            # locker, even within the same process. Release the old fd *before*
+            # opening the new one, otherwise flock(LOCK_EX|LOCK_NB) on the new
+            # fd fails with EWOULDBLOCK even on a force re-init.
+            if in_process_locked:
+                old_fd = self._lock_fds.pop(name)
+                try:
+                    os.close(old_fd)
+                except OSError:
+                    pass
+
+            fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT, 0o644)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (BlockingIOError, OSError):
+                os.close(fd)
+                raise RunLocked(name)
+            self._lock_fds[name] = fd
+
+        # Config conflict: reject if the run already has a different config on
+        # disk. Checked outside the mutex to avoid holding it during file IO.
+        # This catches the "server restarted, trainer re-inits with wrong
+        # config" case where _lock_fds was empty but the run files exist.
+        if cfg_path.exists() and not force:
             try:
                 existing = json.loads(cfg_path.read_text())
-            except FileNotFoundError:
+            except (FileNotFoundError, json.JSONDecodeError):
                 existing = None
-            if existing != config:
+            if existing is not None and existing != config:
+                with self._lock_fds_mu:
+                    if self._lock_fds.get(name) == fd:
+                        del self._lock_fds[name]
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
                 raise RunLocked(name)
-        run_dir.mkdir(parents=True, exist_ok=True)
+
         cfg_path.write_text(json.dumps(config, indent=2, sort_keys=True))
-        lock_path.write_text(json.dumps({"created_at": time.time()}))
+        lock_path.write_text(json.dumps({"pid": os.getpid(), "created_at": time.time()}))
         (run_dir / "metrics.jsonl").touch(exist_ok=True)
 
     def delete_run(self, name: str) -> None:
@@ -120,6 +164,21 @@ class Storage:
         ckpt = self.ckpt_dir / name
         if ckpt.exists():
             shutil.rmtree(ckpt)
+        self._release_lock(name)
+
+    def finish_run(self, name: str) -> None:
+        """Release the active-writer lock so the run can be re-initialised."""
+        _validate_name(name)
+        self._release_lock(name)
+
+    def _release_lock(self, name: str) -> None:
+        with self._lock_fds_mu:
+            fd = self._lock_fds.pop(name, None)
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
     def run_exists(self, name: str) -> bool:
         _validate_name(name)
