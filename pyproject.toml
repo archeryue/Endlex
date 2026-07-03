@@ -1,6 +1,6 @@
 [project]
 name = "endlex"
-version = "0.1.0"
+version = "0.2.0"
 description = "Self-hosted, single-user replacement for wandb metrics tracking and checkpoint sync"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -17,6 +17,7 @@ server = [
 ]
 
 [project.scripts]
+endlex = "endlex.cli:main"
 endlex-server = "endlex.server.app:main"
 
 [dependency-groups]
