@@ -11,10 +11,11 @@ v1 implemented per `TECH_PLAN.md`. **Read TECH_PLAN.md before changing behavior*
 ```
 endlex/
   tracker.py            # client Tracker (hot-path log, daemon batching)
-  checkpoint_sync.py    # upload_checkpoint{,_async} helpers
+  checkpoint_sync.py    # upload/download helpers (sha256, chunked, resumable)
+  cli.py                # `endlex` CLI: runs / ckpts / pull
   server/
     app.py              # FastAPI factory `create_app(data_root)`
-    storage.py          # disk layout: runs/, checkpoints/, JSONL append
+    storage.py          # disk layout: runs/, checkpoints/, JSONL append, manifests
     auth.py             # bearer-token dependencies
     templates/          # dashboard + per-run Chart.js page
 tests/                  # pytest, includes a real-uvicorn e2e
@@ -46,13 +47,19 @@ These are landed and tested; treat them as the authoritative behavior rather tha
 - **Summary cache**: `runs/<name>/.summary.json` sidecar bumped by `append_metrics`. Cache validity by `metrics_size`; mismatch triggers a rescan + repopulate. Keeps `list_runs()` O(1) per run even for very large JSONLs. Perf-gated test verifies cached `list_runs()` < 100 ms over 30 runs × 5k events and ≥5× faster than uncached.
 - **/health**: unauthenticated probe returning `{status, version, runs}`.
 - **Write auth in the browser**: `_base.html` exposes `endlex.authedFetch(url, opts)` which lazy-prompts for `ENDLEX_TOKEN`, caches in `localStorage`, clears on 401/403. Server uses `secrets.compare_digest` for constant-time token check.
+- **Checkpoint integrity**: every upload streams to `<file>.part`, is sha256-verified (client sends checksums; server always computes), then atomically renamed. Per-step `.manifest.json` records `{size, sha256, uploaded_at}`; exposed as `files_meta` in listings and as `X-Endlex-Sha256` on downloads. Filenames starting with `.` or ending `.part` are reserved.
+- **Chunked upload**: `PUT /api/runs/<name>/ckpt/<step>/files/<file>?offset=&total=&sha256=` for files above the client threshold (64 MB default) — required because Cloudflare caps request bodies (~100 MB) and ArcherChat d24 weights are ~2 GB. Sequential offsets enforced; 409 returns the resume point; `GET .../status` probes it. Client falls back to single multipart against pre-chunk servers.
+- **Crash-resume init**: re-init with an identical config is allowed without `force` (treated as the same writer restarting); different config still 409s. This is deliberate — don't "fix" it back to strict locking.
+- **Pull side**: `download_checkpoint()` + `endlex` CLI (`runs` / `ckpts` / `pull`), sha256-verified, `.part` staging on the receiving end too.
 
 ## Tracker hardening beyond the original spec
 
 - **Retry-with-backoff** on 5xx + transport errors. Daemon-thread only; hot path unchanged. Configurable via `retry_delays` kwarg (default `(0.5, 1.0, 2.0)` → 4 attempts). 4xx never retried.
 - **Resync on init**: if the local JSONL has events past the server's count (cloud trainer restart), ship the gap. Scoped to `_initial_local_count` snapshotted at construction to avoid double-shipping events logged in the current session.
+- **Late-init retry**: a failed `/init` no longer kills the daemon; it retries every `init_retry_interval` (default 30 s) and resyncs+drains once the server appears. `finish()` warns if the server was never reachable.
 - **`flush(timeout)`**: synchronously drains the queue + waits for in-flight batch. Use between epochs or before checkpoint upload. Offline-mode no-op.
 - **Warn-at-finish**: stderr warning if `dropped` or `failed_requests` > 0 at finish time. Easy to miss otherwise — hot path swallows everything.
+- **Trainer-safety**: config is JSON-round-tripped with `default=str` at construction (paths/dtypes/enums never crash init — and the sanitized dict is what the server's same-config resume compares); `log()` after `finish()` warns once and drops; events get `_t` (wall-clock) unless `auto_timestamp=False`.
 
 ## CI
 

@@ -51,15 +51,18 @@ No database in v1. JSONL is tail-friendly (the dashboard streams new lines as th
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/api/runs/<name>/init` | Create run dir, store `config.json`. Idempotent. |
+| `POST` | `/api/runs/<name>/init` | Create run dir, store `config.json`. Re-init with an identical config = resume (crash recovery); a different config needs `?force=1`. |
 | `POST` | `/api/runs/<name>/metrics` | Append a **batch** of JSON dicts to `metrics.jsonl`. Body: `[{"step": ..., "train/loss": ...}, ...]` |
-| `POST` | `/api/runs/<name>/ckpt/<step>` | Streamed multipart upload of `model.pt` + `meta.json` |
+| `POST` | `/api/runs/<name>/ckpt/<step>` | Streamed multipart upload; optional `X-Endlex-Checksums: {"<file>": "<sha256>"}` header verified server-side |
+| `PUT` | `/api/runs/<name>/ckpt/<step>/files/<file>` | One sequential chunk (`?offset=&total=&sha256=`). Finalizes (verify + atomic rename) on the last chunk. 409 carries the resume offset. |
+| `GET` | `/api/runs/<name>/ckpt/<step>/files/<file>/status` | Resume point for an interrupted chunked upload |
+| `POST` | `/api/runs/<name>/finish` | Release the single-writer lock |
 | `GET` | `/` | List runs with last-updated timestamp + summary metrics |
 | `GET` | `/run/<name>` | HTML page: config + auto-refreshing charts |
 | `GET` | `/api/runs` | JSON list of runs |
-| `GET` | `/api/runs/<name>` | JSON: config + summary |
+| `GET` | `/api/runs/<name>` | JSON: config + summary + checkpoints (incl. per-file size/sha256) |
 | `GET` | `/api/runs/<name>/metrics` | JSON: full metrics array (or NDJSON stream) |
-| `GET` | `/api/runs/<name>/ckpt/<step>/<file>` | Download a checkpoint file |
+| `GET` | `/api/runs/<name>/ckpt/<step>/<file>` | Download a checkpoint file (`X-Endlex-Sha256` response header) |
 | `DELETE` | `/api/runs/<name>` | Remove a run + all its checkpoints |
 
 All write endpoints require `Authorization: Bearer $ENDLEX_TOKEN`. Read endpoints can be open or token-gated depending on how publicly the user wants the dashboard to be visible.
@@ -136,7 +139,8 @@ Hard rules:
 4. **HTTPS.** Reuse the existing let's encrypt cert + nginx reverse-proxy in front of FastAPI. Never ship checkpoints (or bearer tokens) over plain HTTP.
 5. **WSL2 inbound.** If the existing webpage hosting already works, do nothing extra. FastAPI must `bind 0.0.0.0`. WSL2 mirrored networking (Windows 11) or Windows host port-forwarding both work.
 6. **Disk usage.** `$ENDLEX_DATA/checkpoints/` grows fast at 1–2 GB per d24 save. Either be selective in the trainer (only upload best-val_bpb checkpoints) or add a TTL/retention policy on the server (`keep latest N`, `delete older than N days`).
-7. **Concurrency.** Multiple cloud runs writing to one server is fine because each writes to its own `<run_name>` dir. Two writers to the same `metrics.jsonl` would interleave — enforce one-writer-per-run by checking a lock file at `init`.
+7. **Concurrency.** Multiple cloud runs writing to one server is fine because each writes to its own `<run_name>` dir. Two writers to the same `metrics.jsonl` would interleave — enforce one-writer-per-run by checking a lock file at `init`. **Crash-resume carve-out:** a re-init with an *identical* config is treated as the same (crashed and restarted) writer and allowed through; a different config still 409s without `force`. A crashed trainer never calls `/finish`, so a strict lock would strand the resumed session.
+8. **Proxy body-size caps.** Cloudflare Tunnel (the actual deployment path for `train.endlex.ai`) caps request bodies around 100 MB — far below one d24 checkpoint. Files above `ENDLEX_CHUNK_THRESHOLD` (default 64 MB) therefore upload as sequential ~48 MB chunks that the server stages in a `.part` file and finalizes atomically after sha256 verification. Interrupted transfers resume from the server-reported offset.
 
 ## Roadmap
 
@@ -159,6 +163,14 @@ Hard rules:
 - [x] Static HTML export (`/api/runs/<name>/export.html`, self-contained)
 - [ ] System metrics (GPU util, VRAM, power) sourced via `pynvml` inside the trainer — deferred; no Endlex-side change needed beyond logging the keys, but no test path here without a real GPU
 - [ ] Sample text panel (model generations during training) — deferred; needs a schema decision (how does the trainer log multi-line text, and how does the dashboard render it?)
+
+### v4 — weights-sync hardening (long-term tool posture)
+- [x] Integrity: client-side sha256 on every uploaded file, verified server-side; `.part` staging + atomic rename so torn transfers never look complete; per-step `.manifest.json` (size, sha256, uploaded_at) surfaced in the API and run page
+- [x] Chunked, resumable uploads for large files (`PUT .../files/<name>?offset=&total=&sha256=` + `/status` probe) — fits through Cloudflare's ~100 MB body cap; verified e2e with a 150 MB file through the real tunnel
+- [x] Crash-resume: identical-config re-init allowed without `force`; Tracker retries a failed init in the background instead of going dark for the session
+- [x] Pull side: `download_checkpoint()` + `endlex` CLI (`runs` / `ckpts` / `pull`) with sha256 verification — weights flow home-box → any machine
+- [x] Trainer-safety: non-JSON config values stringified; `log()`-after-`finish()` drops with a warning instead of raising; auto `_t` wall-clock stamp on events (opt-out)
+- [x] Server: blocking disk work (checkpoint writes, rmtree, prune, big reads) moved off the event loop; atomic state/summary sidecar writes; numeric step ordering past `step_999999`
 
 ## Use with ArcherChat
 

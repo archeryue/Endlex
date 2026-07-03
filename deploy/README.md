@@ -3,6 +3,12 @@
 The two files here drop Endlex onto a Linux box that already terminates HTTPS
 via nginx (Let's Encrypt, your existing domain, etc.).
 
+> **Cloudflare Tunnel instead of nginx?** Point an ingress rule at
+> `http://localhost:$ENDLEX_PORT` and skip the nginx snippet. Note Cloudflare
+> caps request bodies (~100 MB) — harmless for Endlex, because the client
+> automatically ships files above 64 MB through the chunked upload API
+> (sequential ~48 MB chunks, resumable, sha256-verified).
+
 ## One-time setup
 
 ```bash

@@ -12,31 +12,44 @@ The mental model is one sentence: **the cloud trainer's local JSONL is the sourc
 
 - `tracker.log()` writes a line-buffered (kill-9-safe) append to local disk, then pushes onto a bounded in-memory queue. Returns in <100 µs.
 - A daemon thread drains the queue and POSTs batches to the server. Bounded queue → drop-oldest under sustained backpressure. Retries with exponential backoff on 5xx + transport errors.
-- A second daemon thread handles checkpoint uploads, so multi-GB transfers can't starve low-latency metric flushes.
+- A second daemon thread handles checkpoint uploads, so multi-GB transfers can't starve low-latency metric flushes. Uploads are sha256-verified end to end, chunked to fit through proxy body-size caps, and resumable after a network drop.
 - Network glitch? Training keeps going. When the cloud trainer restarts, the next `Tracker(...)` automatically resyncs any gap from the local JSONL to the server.
-- When training finishes, your final weights are already on the home box. Tear down the cloud GPU instance — everything downstream (`chat_cli`, eval, inference) runs against the local file system.
+- When training finishes, your final weights are already on the home box. Tear down the cloud GPU instance — everything downstream (`chat_cli`, eval, inference) runs against the local file system. Need them on a third machine? `endlex pull <run>` fetches and verifies them anywhere.
 
 ## Features
 
 **Server**
-- FastAPI app behind your existing nginx + Let's Encrypt; storage is plain files under `$ENDLEX_DATA/` (no DB) — `du -sh`, `rm -rf`, `tail -f` all work
+- FastAPI app behind your existing nginx/cloudflared + TLS; storage is plain files under `$ENDLEX_DATA/` (no DB) — `du -sh`, `rm -rf`, `tail -f` all work
 - Bearer-token auth on writes (constant-time compare); reads configurable open or token-gated
 - Dashboard with sortable runs table, filter grammar (substring / `tag:foo` / `key<op>num`), tags + archive + delete + free-form notes + per-run/global checkpoint retention
 - Multi-run overlay at `/compare?runs=a,b,c` with color-coded legend; self-contained static HTML export at `/api/runs/<name>/export.html`
 - Live updates via SSE (`/api/runs/<name>/metrics/stream`), with 5 s polling as fallback
 - `/health` probe; `POST /api/admin/prune` for cron-driven retention sweep
 - Cached run summaries (`.summary.json` sidecar) so `list_runs()` stays O(1) per run even with many runs × millions of events
+- Checkpoint files land via `.part` staging + atomic rename, with a per-step `.manifest.json` recording size + sha256 — a torn upload can never masquerade as a complete checkpoint
 
 **Client (`endlex.Tracker`)**
 - wandb-shaped API: `init` / `log` / `finish` / `flush` — drop-in for `wandb.log()` call sites
-- Hot-path `log()` median ~3 µs (budget: <100 µs, enforced by a perf gate that runs in CI)
+- Hot-path `log()` median ~3 µs (budget: <100 µs, enforced by a perf gate that runs in CI); auto-stamps `_t` wall-clock time (disable with `auto_timestamp=False`)
 - Local JSONL is the source of truth; daemon thread batches POSTs (defaults: 100 events / 5 s); drop-oldest under sustained backpressure
 - Retry-with-backoff on 5xx + transport errors; warns on stderr at finish if remote diverged from local
-- Resync local → remote on startup, so a cloud trainer that crashed mid-run picks up where it left off
+- Resync local → remote on startup, so a cloud trainer that crashed mid-run picks up where it left off; re-init with an identical config is treated as a resume server-side (no `force=` needed after a crash)
+- If the server is down when training starts, the daemon keeps retrying init in the background and ships everything once it comes up — a dead server at t=0 no longer costs the session
+- Config values that aren't JSON-native (paths, dtypes, enums) are stringified, never crash the trainer; `log()` after `finish()` warns and drops instead of raising mid-training
 
-**Checkpoint sync** (`upload_checkpoint_async`)
-- Multipart streamed upload from `save_checkpoint`; runs in its own daemon thread
-- Local save is the source of truth, remote is best-effort
+**Checkpoint sync** (`upload_checkpoint_async` / `download_checkpoint`)
+- Multipart streamed upload from `save_checkpoint`; runs in its own daemon thread; local save is the source of truth, remote is best-effort
+- Every file's sha256 is computed client-side and verified server-side before the file lands
+- Files over 64 MB ship as sequential chunks (48 MB each, both tunable via `ENDLEX_CHUNK_THRESHOLD` / `ENDLEX_CHUNK_SIZE`) — multi-GB weights flow through proxies with request-body caps (Cloudflare: ~100 MB) and **interrupted transfers resume from the last received byte** instead of restarting
+- `download_checkpoint(run, step=None, dest=".")` pulls weights to any box with sha256 verification — the reverse half of weights sync
+
+**CLI (`endlex`)**
+```bash
+endlex runs                       # list runs on the server
+endlex ckpts my-run               # list checkpoints (sizes + checksums)
+endlex pull my-run                # fetch latest checkpoint, sha256-verified
+endlex pull my-run --step 2000 --dest weights/ --files model.pt
+```
 
 ![run page](docs/screenshots/run-page.png)
 
