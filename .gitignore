@@ -13,6 +13,10 @@ __pycache__/
 data/
 runs/
 checkpoints/
+endlex_runs/
+
+# Secrets (ENDLEX_TOKEN lives here on the deployed box)
+.env
 
 # Editors
 .vscode/
