@@ -91,7 +91,7 @@
 <div class="table-scroll">
 <table>
   <thead>
-    <tr><th>Step</th><th>Files</th></tr>
+    <tr><th>Step</th><th>Files</th><th>Size</th></tr>
   </thead>
   <tbody>
     {% for ck in checkpoints %}
@@ -99,8 +99,14 @@
       <td><code>{{ ck.step }}</code></td>
       <td>
         {% for f in ck.files %}
-          <a href="/api/runs/{{ name }}/ckpt/{{ ck.step.replace('step_', '')|int }}/{{ f }}">{{ f }}</a>{% if not loop.last %}, {% endif %}
+          <a href="/api/runs/{{ name }}/ckpt/{{ ck.step.replace('step_', '')|int }}/{{ f }}"
+             {%- set m = (ck.files_meta or {}).get(f) or {} -%}
+             {%- if m.sha256 %} title="sha256: {{ m.sha256 }}"{% endif %}>{{ f }}</a>{% if not loop.last %}, {% endif %}
         {% endfor %}
+      </td>
+      <td class="num">
+        {%- set total = ((ck.files_meta or {}).values() | map(attribute='size') | select | sum) -%}
+        {%- if total %}{{ "%.1f"|format(total / 1e6) }} MB{% else %}&mdash;{% endif -%}
       </td>
     </tr>
     {% endfor %}

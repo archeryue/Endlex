@@ -42,10 +42,17 @@ def test_init_creates_run(client):
     assert r.json()["config"] == {"lr": 1e-4}
 
 
-def test_init_locked_while_active(client):
-    """Second init on an active run returns 409 (concurrent writer guard)."""
+def test_init_same_config_resumes(client):
+    """Re-init with the same config = crash-resume, allowed without force."""
     _init(client, "r")
     r = client.post("/api/runs/r/init", json={"lr": 1e-4}, headers=AUTH)
+    assert r.status_code == 200
+
+
+def test_init_locked_while_active(client):
+    """Second init with a different config returns 409 (writer guard)."""
+    _init(client, "r")
+    r = client.post("/api/runs/r/init", json={"lr": 9e-9}, headers=AUTH)
     assert r.status_code == 409
 
 
@@ -143,6 +150,136 @@ def test_delete_run(client):
     r = client.delete("/api/runs/r", headers=AUTH)
     assert r.status_code == 204
     assert client.get("/api/runs/r").status_code == 404
+
+
+# ---------- checkpoint integrity + chunked upload ----------
+
+def _sha(data: bytes) -> str:
+    import hashlib
+
+    return hashlib.sha256(data).hexdigest()
+
+
+def test_checkpoint_upload_with_checksums_header(client):
+    _init(client, "r")
+    payload = b"weights" * 128
+    r = client.post(
+        "/api/runs/r/ckpt/1000",
+        files=[("files", ("model.pt", io.BytesIO(payload), "application/octet-stream"))],
+        headers={**AUTH, "X-Endlex-Checksums": json.dumps({"model.pt": _sha(payload)})},
+    )
+    assert r.status_code == 200, r.text
+
+
+def test_checkpoint_upload_rejects_bad_checksum(client):
+    _init(client, "r")
+    r = client.post(
+        "/api/runs/r/ckpt/1000",
+        files=[("files", ("model.pt", io.BytesIO(b"data"), "application/octet-stream"))],
+        headers={**AUTH, "X-Endlex-Checksums": json.dumps({"model.pt": "0" * 64})},
+    )
+    assert r.status_code == 422
+    # the corrupt transfer must not land as a downloadable file
+    assert client.get("/api/runs/r/ckpt/1000/model.pt").status_code == 404
+
+
+def test_chunked_upload_roundtrip(client):
+    _init(client, "r")
+    payload = b"W" * 3000
+    sha = _sha(payload)
+    url = "/api/runs/r/ckpt/2000/files/model.pt"
+
+    r = client.put(
+        url,
+        params={"offset": 0, "total": 3000, "sha256": sha},
+        content=payload[:2000],
+        headers=AUTH,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json() == {"received": 2000, "complete": False}
+
+    # status endpoint reports the resume point
+    st = client.get(f"{url}/status", headers=AUTH).json()
+    assert st["received"] == 2000 and st["complete"] is False
+
+    r = client.put(
+        url,
+        params={"offset": 2000, "total": 3000, "sha256": sha},
+        content=payload[2000:],
+        headers=AUTH,
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["complete"] is True and body["sha256"] == sha
+
+    # downloadable, byte-identical, with the sha header
+    dl = client.get("/api/runs/r/ckpt/2000/model.pt")
+    assert dl.status_code == 200
+    assert dl.content == payload
+    assert dl.headers["x-endlex-sha256"] == sha
+
+    # listed with files_meta
+    info = client.get("/api/runs/r").json()
+    ck = info["checkpoints"][0]
+    assert ck["files"] == ["model.pt"]
+    assert ck["files_meta"]["model.pt"]["sha256"] == sha
+
+
+def test_chunked_upload_wrong_offset_is_409_with_resume_point(client):
+    _init(client, "r")
+    payload = b"W" * 100
+    sha = _sha(payload + payload)
+    url = "/api/runs/r/ckpt/2000/files/model.pt"
+    client.put(
+        url,
+        params={"offset": 0, "total": 200, "sha256": sha},
+        content=payload,
+        headers=AUTH,
+    )
+    r = client.put(
+        url,
+        params={"offset": 0, "total": 200, "sha256": sha},  # duplicate chunk
+        content=payload,
+        headers=AUTH,
+    )
+    assert r.status_code == 409
+    assert r.json()["received"] == 100
+
+
+def test_chunked_upload_checksum_mismatch_is_422(client):
+    _init(client, "r")
+    r = client.put(
+        "/api/runs/r/ckpt/2000/files/model.pt",
+        params={"offset": 0, "total": 4, "sha256": "0" * 64},
+        content=b"data",
+        headers=AUTH,
+    )
+    assert r.status_code == 422
+
+
+def test_chunked_upload_requires_auth(client):
+    _init(client, "r")
+    r = client.put(
+        "/api/runs/r/ckpt/2000/files/model.pt",
+        params={"offset": 0, "total": 4, "sha256": "0" * 64},
+        content=b"data",
+    )
+    assert r.status_code == 401
+
+
+def test_chunked_upload_applies_retention_on_completion(client):
+    _init(client, "r")
+    client.patch("/api/runs/r/state", json={"retention": {"keep_last": 1}}, headers=AUTH)
+    for step in (1000, 2000):
+        data = f"w{step}".encode()
+        client.put(
+            f"/api/runs/r/ckpt/{step}/files/m.pt",
+            params={"offset": 0, "total": len(data), "sha256": _sha(data)},
+            content=data,
+            headers=AUTH,
+        )
+    info = client.get("/api/runs/r").json()
+    assert [c["step"] for c in info["checkpoints"]] == ["step_002000"]
 
 
 # ---------- reads ----------

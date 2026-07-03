@@ -6,6 +6,11 @@ Layout under ``data_root``::
     runs/<name>/metrics.jsonl   # append-only, one JSON dict per .log()
     runs/<name>/.lock           # single-writer sentinel checked at init
     checkpoints/<name>/step_<NNNNNN>/<file>
+    checkpoints/<name>/step_<NNNNNN>/.manifest.json  # {file: {size, sha256, uploaded_at}}
+
+Checkpoint files are streamed to ``<file>.part`` and atomically renamed into
+place only after the full payload (and its sha256, when provided) checks out —
+a partially-uploaded checkpoint can never be mistaken for a complete one.
 
 No DB. JSONL is tail-friendly; rm -rf cleans up.
 """
@@ -13,6 +18,7 @@ No DB. JSONL is tail-friendly; rm -rf cleans up.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -25,6 +31,10 @@ from typing import Any, BinaryIO, Iterable
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-]{0,127}$")
 _STEP_RE = re.compile(r"^[0-9]{1,12}$")
+_SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+
+_MANIFEST_NAME = ".manifest.json"
+_PART_SUFFIX = ".part"
 
 
 class StorageError(Exception):
@@ -41,6 +51,18 @@ class RunNotFound(StorageError):
 
 class RunLocked(StorageError):
     """init called on an already-active run (concurrent writer) or a config conflict."""
+
+
+class ChecksumMismatch(StorageError):
+    """Uploaded bytes don't hash to the client-declared sha256."""
+
+
+class ChunkOffsetMismatch(StorageError):
+    """Chunk arrived at the wrong offset. ``received`` is the resume point."""
+
+    def __init__(self, received: int):
+        super().__init__(f"expected chunk at offset {received}")
+        self.received = received
 
 
 @dataclass(frozen=True)
@@ -70,10 +92,35 @@ def _validate_step(step: str) -> None:
 def _validate_filename(filename: str) -> None:
     if "/" in filename or "\\" in filename or filename in ("", ".", ".."):
         raise InvalidName(f"invalid filename: {filename!r}")
+    # Reserved names: the manifest sidecar, dotfiles, and .part staging files
+    # would collide with internal bookkeeping.
+    if filename.startswith(".") or filename.endswith(_PART_SUFFIX):
+        raise InvalidName(f"invalid filename: {filename!r}")
+
+
+def _validate_sha256(sha256: str) -> str:
+    if not _SHA256_RE.match(sha256):
+        raise InvalidName(f"invalid sha256: {sha256!r}")
+    return sha256.lower()
 
 
 def _step_dirname(step: str | int) -> str:
     return f"step_{int(step):06d}"
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write via tmp + rename so a crash can't leave a torn file behind."""
+    tmp = path.parent / (path.name + ".tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+def _sha256_of_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 class Storage:
@@ -96,6 +143,9 @@ class Storage:
         # it with this in-memory dict to catch concurrent in-process callers.
         self._lock_fds: dict[str, int] = {}
         self._lock_fds_mu = threading.Lock()
+        # Serializes manifest read-modify-write and chunk appends. Uploads are
+        # disk-bound and single-user, so one coarse lock is plenty.
+        self._ckpt_mu = threading.Lock()
 
     # ----- runs -----
 
@@ -108,9 +158,26 @@ class Storage:
         lock_path = run_dir / ".lock"
         run_dir.mkdir(parents=True, exist_ok=True)
 
+        # Compare against the config already on disk. A re-init with an
+        # *identical* config is treated as a resume (crashed trainer restarting
+        # with the same run) and is always allowed — the crashed process never
+        # got to call /finish, so blocking on the stale lock would strand the
+        # whole resumed session. A *different* config still requires force,
+        # whether or not the lock is held.
+        same_config = False
+        config_conflict = False
+        if cfg_path.exists():
+            try:
+                existing = json.loads(cfg_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                existing = None  # corrupt/unreadable — don't block re-init on it
+            if existing is not None:
+                same_config = existing == config
+                config_conflict = not same_config
+
         with self._lock_fds_mu:
             in_process_locked = name in self._lock_fds
-            if in_process_locked and not force:
+            if in_process_locked and not force and not same_config:
                 raise RunLocked(name)
 
             # Linux flock treats each open file description as an independent
@@ -133,25 +200,19 @@ class Storage:
             self._lock_fds[name] = fd
 
         # Config conflict: reject if the run already has a different config on
-        # disk. Checked outside the mutex to avoid holding it during file IO.
-        # This catches the "server restarted, trainer re-inits with wrong
+        # disk. This catches the "server restarted, trainer re-inits with wrong
         # config" case where _lock_fds was empty but the run files exist.
-        if cfg_path.exists() and not force:
+        if config_conflict and not force:
+            with self._lock_fds_mu:
+                if self._lock_fds.get(name) == fd:
+                    del self._lock_fds[name]
             try:
-                existing = json.loads(cfg_path.read_text())
-            except (FileNotFoundError, json.JSONDecodeError):
-                existing = None
-            if existing is not None and existing != config:
-                with self._lock_fds_mu:
-                    if self._lock_fds.get(name) == fd:
-                        del self._lock_fds[name]
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-                raise RunLocked(name)
+                os.close(fd)
+            except OSError:
+                pass
+            raise RunLocked(name)
 
-        cfg_path.write_text(json.dumps(config, indent=2, sort_keys=True))
+        _atomic_write_text(cfg_path, json.dumps(config, indent=2, sort_keys=True))
         lock_path.write_text(json.dumps({"pid": os.getpid(), "created_at": time.time()}))
         (run_dir / "metrics.jsonl").touch(exist_ok=True)
 
@@ -213,7 +274,11 @@ class Storage:
         data = "".join(lines).encode("utf-8")
         fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
         try:
-            os.write(fd, data)
+            # os.write may report a short write for large batches — loop.
+            view = memoryview(data)
+            while view:
+                n = os.write(fd, view)
+                view = view[n:]
         finally:
             os.close(fd)
         # Bump the summary cache so the dashboard's _summarize stays O(1)
@@ -350,7 +415,8 @@ class Storage:
     ) -> None:
         cache_path = run_dir / ".summary.json"
         try:
-            cache_path.write_text(
+            _atomic_write_text(
+                cache_path,
                 json.dumps(
                     {
                         "num_events": num_events,
@@ -358,7 +424,7 @@ class Storage:
                         "last_updated": last_updated,
                         "metrics_size": metrics_size,
                     }
-                )
+                ),
             )
         except OSError:
             pass  # cache is best-effort
@@ -500,8 +566,8 @@ class Storage:
                             ) from e
                 normalized_panels.append(norm)
             state["panels"] = normalized_panels
-        (run_dir / "state.json").write_text(
-            json.dumps(state, indent=2, sort_keys=True)
+        _atomic_write_text(
+            run_dir / "state.json", json.dumps(state, indent=2, sort_keys=True)
         )
         return state
 
@@ -533,19 +599,165 @@ class Storage:
         return d / filename
 
     def write_checkpoint_file(
-        self, name: str, step: str | int, filename: str, source: BinaryIO
+        self,
+        name: str,
+        step: str | int,
+        filename: str,
+        source: BinaryIO,
+        *,
+        expected_sha256: str | None = None,
     ) -> int:
-        """Stream `source` to disk, return bytes written."""
+        """Stream `source` to a .part file, verify, atomically rename. Returns bytes written.
+
+        The sha256 is computed while streaming; if ``expected_sha256`` is given
+        and doesn't match, the .part file is removed and :class:`ChecksumMismatch`
+        raised — a corrupted transfer can never land as a real checkpoint file.
+        """
+        if expected_sha256 is not None:
+            expected_sha256 = _validate_sha256(expected_sha256)
         dest = self.open_checkpoint_for_write(name, step, filename)
+        part = dest.parent / (dest.name + _PART_SUFFIX)
         written = 0
-        with dest.open("wb") as out:
-            while True:
-                chunk = source.read(1 << 20)  # 1 MiB
-                if not chunk:
-                    break
-                out.write(chunk)
-                written += len(chunk)
+        h = hashlib.sha256()
+        try:
+            with part.open("wb") as out:
+                while True:
+                    chunk = source.read(1 << 20)  # 1 MiB
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    h.update(chunk)
+                    written += len(chunk)
+            digest = h.hexdigest()
+            if expected_sha256 is not None and digest != expected_sha256:
+                raise ChecksumMismatch(
+                    f"{filename}: expected {expected_sha256}, got {digest}"
+                )
+            os.replace(part, dest)
+        except BaseException:
+            part.unlink(missing_ok=True)
+            raise
+        self._record_in_manifest(dest.parent, filename, written, digest)
         return written
+
+    # -- chunked upload (large files through proxies with request-size caps) --
+
+    def checkpoint_upload_status(
+        self, name: str, step: str | int, filename: str
+    ) -> dict[str, Any]:
+        """Where a (possibly interrupted) upload stands. Drives client resume."""
+        _validate_name(name)
+        _validate_step(str(step))
+        _validate_filename(filename)
+        if not (self.runs_dir / name).is_dir():
+            raise RunNotFound(name)
+        dest = self.ckpt_dir / name / _step_dirname(step) / filename
+        part = dest.parent / (dest.name + _PART_SUFFIX)
+        if dest.exists():
+            meta = self.checkpoint_manifest(name, step).get(filename, {})
+            return {
+                "received": dest.stat().st_size,
+                "complete": True,
+                "sha256": meta.get("sha256"),
+            }
+        if part.exists():
+            return {"received": part.stat().st_size, "complete": False, "sha256": None}
+        return {"received": 0, "complete": False, "sha256": None}
+
+    def append_checkpoint_chunk(
+        self,
+        name: str,
+        step: str | int,
+        filename: str,
+        data: bytes,
+        *,
+        offset: int,
+        total: int,
+        sha256: str,
+    ) -> dict[str, Any]:
+        """Append one sequential chunk; finalize (verify + rename) on the last.
+
+        Chunks must arrive in order: ``offset`` has to equal the bytes already
+        staged, otherwise :class:`ChunkOffsetMismatch` reports the resume
+        point. When the staged size reaches ``total`` the whole .part file is
+        hashed against ``sha256``; mismatch discards the staging file.
+        """
+        sha256 = _validate_sha256(sha256)
+        if total <= 0:
+            raise InvalidName(f"invalid total size: {total}")
+        dest = self.open_checkpoint_for_write(name, step, filename)
+        part = dest.parent / (dest.name + _PART_SUFFIX)
+        with self._ckpt_mu:
+            # Re-upload of a completed file: start over (trainer may be
+            # overwriting a checkpoint after a force re-init).
+            current = part.stat().st_size if part.exists() else 0
+            if offset != current:
+                raise ChunkOffsetMismatch(current)
+            if current + len(data) > total:
+                raise InvalidName(
+                    f"chunk overruns declared total ({current}+{len(data)} > {total})"
+                )
+            with part.open("ab") as out:
+                out.write(data)
+            new_size = current + len(data)
+            if new_size < total:
+                return {"received": new_size, "complete": False}
+            digest = _sha256_of_file(part)
+            if digest != sha256:
+                part.unlink(missing_ok=True)
+                raise ChecksumMismatch(
+                    f"{filename}: expected {sha256}, got {digest}"
+                )
+            os.replace(part, dest)
+            self._record_in_manifest(
+                dest.parent, filename, new_size, digest, locked=True
+            )
+            return {"received": new_size, "complete": True, "sha256": digest}
+
+    # -- manifest --
+
+    def checkpoint_manifest(self, name: str, step: str | int) -> dict[str, Any]:
+        _validate_name(name)
+        _validate_step(str(step))
+        p = self.ckpt_dir / name / _step_dirname(step) / _MANIFEST_NAME
+        try:
+            raw = json.loads(p.read_text())
+            return raw if isinstance(raw, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _record_in_manifest(
+        self,
+        step_dir: Path,
+        filename: str,
+        size: int,
+        sha256: str,
+        *,
+        locked: bool = False,
+    ) -> None:
+        def _do() -> None:
+            p = step_dir / _MANIFEST_NAME
+            try:
+                manifest = json.loads(p.read_text())
+                if not isinstance(manifest, dict):
+                    manifest = {}
+            except (OSError, json.JSONDecodeError):
+                manifest = {}
+            manifest[filename] = {
+                "size": size,
+                "sha256": sha256,
+                "uploaded_at": time.time(),
+            }
+            try:
+                _atomic_write_text(p, json.dumps(manifest, indent=2, sort_keys=True))
+            except OSError:
+                pass  # manifest is best-effort metadata
+
+        if locked:  # caller already holds _ckpt_mu
+            _do()
+        else:
+            with self._ckpt_mu:
+                _do()
 
     def checkpoint_file_path(self, name: str, step: str | int, filename: str) -> Path:
         _validate_name(name)
@@ -557,16 +769,41 @@ class Storage:
         return p
 
     def list_checkpoints(self, name: str) -> list[dict[str, Any]]:
+        """Steps in numeric order. ``files`` keeps the legacy name-list shape;
+        ``files_meta`` adds per-file size + sha256 from the manifest."""
         _validate_name(name)
         d = self.ckpt_dir / name
         if not d.is_dir():
             return []
         out: list[dict[str, Any]] = []
-        for step_dir in sorted(d.iterdir()):
-            if not step_dir.is_dir():
-                continue
-            files = sorted(p.name for p in step_dir.iterdir() if p.is_file())
-            out.append({"step": step_dir.name, "files": files})
+        for _, step_dir in self._checkpoint_step_dirs(name):
+            files: list[str] = []
+            files_meta: dict[str, Any] = {}
+            manifest = None
+            for p in sorted(step_dir.iterdir()):
+                if not p.is_file():
+                    continue
+                # Hide bookkeeping: manifest, staging .part files, dotfiles.
+                if p.name.startswith(".") or p.name.endswith(_PART_SUFFIX):
+                    continue
+                if manifest is None:
+                    try:
+                        manifest = json.loads(
+                            (step_dir / _MANIFEST_NAME).read_text()
+                        )
+                        if not isinstance(manifest, dict):
+                            manifest = {}
+                    except (OSError, json.JSONDecodeError):
+                        manifest = {}
+                files.append(p.name)
+                entry = manifest.get(p.name) or {}
+                files_meta[p.name] = {
+                    "size": p.stat().st_size,
+                    "sha256": entry.get("sha256"),
+                }
+            out.append(
+                {"step": step_dir.name, "files": files, "files_meta": files_meta}
+            )
         return out
 
     def _checkpoint_step_dirs(self, name: str) -> list[tuple[int, Path]]:
@@ -612,12 +849,15 @@ class Storage:
         if max_age_seconds is not None and max_age_seconds > 0:
             cutoff = time.time() - max_age_seconds
             for _, p in steps:
-                if p.stat().st_mtime >= cutoff:
-                    keep.add(p)
+                try:
+                    if p.stat().st_mtime >= cutoff:
+                        keep.add(p)
+                except FileNotFoundError:
+                    keep.add(p)  # vanished concurrently — nothing to prune
         deleted: list[str] = []
         for _, p in steps:
             if p in keep:
                 continue
-            shutil.rmtree(p)
+            shutil.rmtree(p, ignore_errors=True)
             deleted.append(p.name)
         return deleted

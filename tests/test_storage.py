@@ -30,11 +30,20 @@ def test_init_run_creates_files(store: Storage):
     assert json.loads((run_dir / "config.json").read_text()) == {"lr": 1e-4}
 
 
-def test_init_run_locked_while_active(store: Storage):
-    """A second init on an active run raises RunLocked (concurrent-writer guard)."""
+def test_init_run_same_config_resumes(store: Storage):
+    """Re-init with an identical config is a crash-resume, not a conflict.
+
+    A crashed trainer never calls finish_run, so the stale lock must not
+    strand the restarted session."""
+    store.init_run("run1", {"lr": 1e-4})
+    store.init_run("run1", {"lr": 1e-4})  # no error — resume
+
+
+def test_init_run_locked_while_active_different_config(store: Storage):
+    """A second init with a DIFFERENT config raises RunLocked."""
     store.init_run("run1", {"lr": 1e-4})
     with pytest.raises(RunLocked):
-        store.init_run("run1", {"lr": 1e-4})
+        store.init_run("run1", {"lr": 5e-5})
 
 
 def test_init_run_reinit_after_finish(store: Storage):
@@ -144,6 +153,141 @@ def test_checkpoint_rejects_path_traversal(store: Storage):
 def test_checkpoint_requires_existing_run(store: Storage):
     with pytest.raises(RunNotFound):
         store.write_checkpoint_file("ghost", 1000, "model.pt", io.BytesIO(b"x"))
+
+
+# ---------- checkpoint integrity + chunked upload ----------
+
+def _sha(data: bytes) -> str:
+    import hashlib
+
+    return hashlib.sha256(data).hexdigest()
+
+
+def test_checkpoint_write_verifies_sha256(store: Storage):
+    from endlex.server.storage import ChecksumMismatch
+
+    store.init_run("r", {})
+    payload = b"weights" * 100
+    store.write_checkpoint_file(
+        "r", 1000, "model.pt", io.BytesIO(payload), expected_sha256=_sha(payload)
+    )
+    with pytest.raises(ChecksumMismatch):
+        store.write_checkpoint_file(
+            "r", 1000, "bad.pt", io.BytesIO(payload), expected_sha256="0" * 64
+        )
+    step_dir = store.ckpt_dir / "r" / "step_001000"
+    assert not (step_dir / "bad.pt").exists()
+    assert not (step_dir / "bad.pt.part").exists()  # staging cleaned up
+
+
+def test_checkpoint_write_records_manifest(store: Storage):
+    store.init_run("r", {})
+    payload = b"\x01\x02" * 512
+    store.write_checkpoint_file("r", 1000, "model.pt", io.BytesIO(payload))
+    manifest = store.checkpoint_manifest("r", 1000)
+    assert manifest["model.pt"]["size"] == len(payload)
+    assert manifest["model.pt"]["sha256"] == _sha(payload)
+
+
+def test_checkpoint_list_exposes_files_meta_and_hides_internals(store: Storage):
+    store.init_run("r", {})
+    payload = b"abc" * 100
+    store.write_checkpoint_file("r", 1000, "model.pt", io.BytesIO(payload))
+    # Leave a stale .part file behind — must not be listed.
+    (store.ckpt_dir / "r" / "step_001000" / "junk.pt.part").write_bytes(b"x")
+    cks = store.list_checkpoints("r")
+    assert cks[0]["files"] == ["model.pt"]
+    meta = cks[0]["files_meta"]["model.pt"]
+    assert meta["size"] == len(payload)
+    assert meta["sha256"] == _sha(payload)
+
+
+def test_checkpoint_list_orders_steps_numerically(store: Storage):
+    store.init_run("r", {})
+    for step in (999999, 1000000, 500):
+        store.write_checkpoint_file("r", step, "m.pt", io.BytesIO(b"x"))
+    steps = [c["step"] for c in store.list_checkpoints("r")]
+    assert steps == ["step_000500", "step_999999", "step_1000000"]
+
+
+def test_checkpoint_rejects_reserved_filenames(store: Storage):
+    store.init_run("r", {})
+    for bad in (".manifest.json", ".hidden", "model.pt.part"):
+        with pytest.raises(InvalidName):
+            store.write_checkpoint_file("r", 1000, bad, io.BytesIO(b"x"))
+
+
+def test_chunked_upload_happy_path(store: Storage):
+    store.init_run("r", {})
+    payload = b"W" * 2500
+    sha = _sha(payload)
+    r1 = store.append_checkpoint_chunk(
+        "r", 1000, "model.pt", payload[:1000], offset=0, total=2500, sha256=sha
+    )
+    assert r1 == {"received": 1000, "complete": False}
+    r2 = store.append_checkpoint_chunk(
+        "r", 1000, "model.pt", payload[1000:2000], offset=1000, total=2500, sha256=sha
+    )
+    assert r2["complete"] is False
+    r3 = store.append_checkpoint_chunk(
+        "r", 1000, "model.pt", payload[2000:], offset=2000, total=2500, sha256=sha
+    )
+    assert r3["complete"] is True
+    assert r3["sha256"] == sha
+    final = store.ckpt_dir / "r" / "step_001000" / "model.pt"
+    assert final.read_bytes() == payload
+    assert not (store.ckpt_dir / "r" / "step_001000" / "model.pt.part").exists()
+    assert store.checkpoint_manifest("r", 1000)["model.pt"]["sha256"] == sha
+
+
+def test_chunked_upload_wrong_offset_reports_resume_point(store: Storage):
+    from endlex.server.storage import ChunkOffsetMismatch
+
+    store.init_run("r", {})
+    payload = b"W" * 200
+    sha = _sha(payload)
+    store.append_checkpoint_chunk(
+        "r", 1000, "m.pt", payload[:100], offset=0, total=200, sha256=sha
+    )
+    with pytest.raises(ChunkOffsetMismatch) as ei:
+        store.append_checkpoint_chunk(
+            "r", 1000, "m.pt", payload[:100], offset=0, total=200, sha256=sha
+        )
+    assert ei.value.received == 100  # resume from here
+
+
+def test_chunked_upload_checksum_mismatch_discards_staging(store: Storage):
+    from endlex.server.storage import ChecksumMismatch
+
+    store.init_run("r", {})
+    with pytest.raises(ChecksumMismatch):
+        store.append_checkpoint_chunk(
+            "r", 1000, "m.pt", b"corrupted", offset=0, total=9, sha256="0" * 64
+        )
+    step_dir = store.ckpt_dir / "r" / "step_001000"
+    assert not (step_dir / "m.pt").exists()
+    assert not (step_dir / "m.pt.part").exists()
+
+
+def test_checkpoint_upload_status_tracks_progress(store: Storage):
+    store.init_run("r", {})
+    payload = b"W" * 200
+    sha = _sha(payload)
+    assert store.checkpoint_upload_status("r", 1000, "m.pt") == {
+        "received": 0,
+        "complete": False,
+        "sha256": None,
+    }
+    store.append_checkpoint_chunk(
+        "r", 1000, "m.pt", payload[:150], offset=0, total=200, sha256=sha
+    )
+    st = store.checkpoint_upload_status("r", 1000, "m.pt")
+    assert st == {"received": 150, "complete": False, "sha256": None}
+    store.append_checkpoint_chunk(
+        "r", 1000, "m.pt", payload[150:], offset=150, total=200, sha256=sha
+    )
+    st = store.checkpoint_upload_status("r", 1000, "m.pt")
+    assert st == {"received": 200, "complete": True, "sha256": sha}
 
 
 # ---------- state (tags + archived) ----------

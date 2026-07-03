@@ -32,8 +32,11 @@ from fastapi.responses import (
 )
 from fastapi.templating import Jinja2Templates
 
+from endlex import __version__
 from endlex.server.auth import require_read_auth, require_write_auth
 from endlex.server.storage import (
+    ChecksumMismatch,
+    ChunkOffsetMismatch,
     InvalidName,
     RunLocked,
     RunNotFound,
@@ -53,7 +56,7 @@ def create_app(data_root: str | os.PathLike[str] | None = None) -> FastAPI:
         default_max_age_days=float(os.environ.get("ENDLEX_CKPT_MAX_AGE_DAYS", "0")),
     )
     templates = Jinja2Templates(directory=str(_TEMPLATE_DIR))
-    app = FastAPI(title="Endlex", version="0.1.0")
+    app = FastAPI(title="Endlex", version=__version__)
     app.state.storage = storage
     app.state.templates = templates
     _register_routes(app)
@@ -111,6 +114,18 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 — long but flat
             status_code=409,
         )
 
+    @app.exception_handler(ChecksumMismatch)
+    async def _bad_checksum(_: Request, exc: ChecksumMismatch):
+        return JSONResponse({"error": f"checksum mismatch: {exc}"}, status_code=422)
+
+    @app.exception_handler(ChunkOffsetMismatch)
+    async def _bad_offset(_: Request, exc: ChunkOffsetMismatch):
+        # 409 + the resume point: the client re-queries and continues from
+        # `received` instead of restarting a multi-GB transfer.
+        return JSONResponse(
+            {"error": str(exc), "received": exc.received}, status_code=409
+        )
+
     # ---------- writes ----------
 
     @app.post(
@@ -150,23 +165,101 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 — long but flat
         step: str,
         storage: StorageDep,
         files: list[UploadFile],
+        request: Request,
     ):
         if not files:
             raise HTTPException(400, "no files in upload")
+        # Optional integrity header: {"model.pt": "<sha256 hex>", ...}.
+        # Filenames may contain '=' or ';' so a JSON header beats k=v pairs.
+        checksums: dict[str, str] = {}
+        raw = request.headers.get("x-endlex-checksums")
+        if raw:
+            try:
+                parsed = _json.loads(raw)
+                if isinstance(parsed, dict):
+                    checksums = {str(k): str(v) for k, v in parsed.items()}
+            except _json.JSONDecodeError:
+                raise HTTPException(400, "malformed X-Endlex-Checksums header")
         written: dict[str, int] = {}
         for f in files:
             if not f.filename:
                 raise HTTPException(400, "file missing filename")
-            written[f.filename] = storage.write_checkpoint_file(
-                name, step, f.filename, f.file
+            # Disk copy of a multi-GB spool must not stall the event loop.
+            written[f.filename] = await asyncio.to_thread(
+                storage.write_checkpoint_file,
+                name,
+                step,
+                f.filename,
+                f.file,
+                expected_sha256=checksums.get(f.filename),
             )
         # Apply retention immediately after each successful upload so the
         # disk doesn't blow past the cap between sweeps.
         keep_last, max_age = storage.resolved_retention(name)
-        pruned = storage.prune_checkpoints(
-            name, keep_last=keep_last, max_age_seconds=max_age
+        pruned = await asyncio.to_thread(
+            storage.prune_checkpoints,
+            name,
+            keep_last=keep_last,
+            max_age_seconds=max_age,
         )
         return {"name": name, "step": step, "written": written, "pruned": pruned}
+
+    # -- chunked checkpoint upload --
+    #
+    # Large checkpoints (multi-GB model weights) cannot ship as one request
+    # through proxies with body-size caps (Cloudflare: ~100 MB). The client
+    # splits each file into sequential chunks; the server stages them in a
+    # .part file and finalizes (sha256 verify + atomic rename) on the last.
+
+    @app.put(
+        "/api/runs/{name}/ckpt/{step}/files/{filename}",
+        dependencies=[Depends(require_write_auth)],
+    )
+    async def upload_ckpt_chunk(
+        name: str,
+        step: str,
+        filename: str,
+        request: Request,
+        storage: StorageDep,
+        offset: int = Query(ge=0),
+        total: int = Query(ge=1),
+        sha256: str = Query(min_length=64, max_length=64),
+    ):
+        data = await request.body()
+        if not data:
+            raise HTTPException(400, "empty chunk")
+        result = await asyncio.to_thread(
+            storage.append_checkpoint_chunk,
+            name,
+            step,
+            filename,
+            data,
+            offset=offset,
+            total=total,
+            sha256=sha256,
+        )
+        if result.get("complete"):
+            keep_last, max_age = storage.resolved_retention(name)
+            result["pruned"] = await asyncio.to_thread(
+                storage.prune_checkpoints,
+                name,
+                keep_last=keep_last,
+                max_age_seconds=max_age,
+            )
+        return result
+
+    @app.get(
+        "/api/runs/{name}/ckpt/{step}/files/{filename}/status",
+        dependencies=[Depends(require_write_auth)],
+    )
+    async def ckpt_upload_status(
+        name: str,
+        step: str,
+        filename: str,
+        storage: StorageDep,
+    ):
+        """Resume point for an interrupted chunked upload."""
+        return storage.checkpoint_upload_status(name, step, filename)
 
     @app.post(
         "/api/admin/prune",
@@ -174,15 +267,18 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 — long but flat
     )
     async def prune_all(storage: StorageDep):
         """Apply retention to every run. For cron use."""
-        result: dict[str, list[str]] = {}
-        for s in storage.list_runs():
-            keep_last, max_age = storage.resolved_retention(s.name)
-            pruned = storage.prune_checkpoints(
-                s.name, keep_last=keep_last, max_age_seconds=max_age
-            )
-            if pruned:
-                result[s.name] = pruned
-        return {"pruned": result}
+        def _sweep() -> dict[str, list[str]]:
+            result: dict[str, list[str]] = {}
+            for s in storage.list_runs():
+                keep_last, max_age = storage.resolved_retention(s.name)
+                pruned = storage.prune_checkpoints(
+                    s.name, keep_last=keep_last, max_age_seconds=max_age
+                )
+                if pruned:
+                    result[s.name] = pruned
+            return result
+
+        return {"pruned": await asyncio.to_thread(_sweep)}
 
     @app.post(
         "/api/runs/{name}/finish",
@@ -201,7 +297,8 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 — long but flat
         status_code=204,
     )
     async def delete_run(name: str, storage: StorageDep):
-        storage.delete_run(name)
+        # rmtree of a many-GB checkpoint tree off the event loop.
+        await asyncio.to_thread(storage.delete_run, name)
         return Response(status_code=204)
 
     @app.patch(
@@ -247,7 +344,9 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 — long but flat
         storage: StorageDep,
         since: int = Query(default=0, ge=0),
     ):
-        events, new_offset = storage.read_metrics(name, since_offset=since)
+        events, new_offset = await asyncio.to_thread(
+            storage.read_metrics, name, since_offset=since
+        )
         return {"events": events, "offset": new_offset}
 
     @app.get(
@@ -330,7 +429,12 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 — long but flat
         storage: StorageDep,
     ):
         path = storage.checkpoint_file_path(name, step, filename)
-        return FileResponse(path, filename=filename)
+        # Ship the recorded sha256 so pullers can verify what they fetched.
+        headers = {}
+        sha = storage.checkpoint_manifest(name, step).get(filename, {}).get("sha256")
+        if sha:
+            headers["X-Endlex-Sha256"] = sha
+        return FileResponse(path, filename=filename, headers=headers)
 
     @app.get(
         "/api/runs/{name}/export.html",
@@ -345,7 +449,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 — long but flat
     ):
         if not storage.run_exists(name):
             raise RunNotFound(name)
-        events, _ = storage.read_metrics(name)
+        events, _ = await asyncio.to_thread(storage.read_metrics, name)
         import datetime as _dt
 
         response = _templates_of(request).TemplateResponse(
