@@ -22,6 +22,9 @@ def _make_tracker(
     tmp_path: Path, *, online: bool, server_data: Path | None = None, **kwargs
 ) -> Tracker:
     local_dir = tmp_path / "local"
+    # Most tests compare logged events verbatim — disable the automatic
+    # wall-clock stamp here; test_auto_timestamp covers it explicitly.
+    kwargs.setdefault("auto_timestamp", False)
     if online:
         assert server_data is not None
         app = create_app(server_data)
@@ -222,6 +225,7 @@ def _make_tracker_with_handler(tmp_path: Path, handler, **kw):
     client = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://test")
     client.headers["Authorization"] = "Bearer t"
     kw.setdefault("retry_delays", (0.01, 0.02))  # tiny delays for fast tests
+    kw.setdefault("auto_timestamp", False)
     return Tracker(
         project="p",
         name="n",
@@ -406,6 +410,112 @@ def test_finish_no_warn_when_clean(tmp_path: Path, server_data: Path, capsys):
     t.log({"step": 1})
     t.finish(timeout=5)
     assert "notable conditions" not in capsys.readouterr().err
+
+
+# ---------- robustness hardening ----------
+
+def test_auto_timestamp_added_by_default(tmp_path: Path):
+    t = Tracker(project="p", name="r", config={}, local_dir=tmp_path / "local")
+    before = time.time()
+    t.log({"step": 1})
+    t.finish()
+    line = json.loads(
+        (tmp_path / "local" / "p" / "r" / "metrics.jsonl").read_text().splitlines()[0]
+    )
+    assert line["step"] == 1
+    assert before <= line["_t"] <= time.time()
+
+
+def test_auto_timestamp_respects_existing_key(tmp_path: Path):
+    t = Tracker(project="p", name="r", config={}, local_dir=tmp_path / "local")
+    t.log({"step": 1, "_t": 123.0})
+    t.finish()
+    line = json.loads(
+        (tmp_path / "local" / "p" / "r" / "metrics.jsonl").read_text().splitlines()[0]
+    )
+    assert line["_t"] == 123.0
+
+
+def test_log_does_not_mutate_caller_event(tmp_path: Path):
+    t = Tracker(project="p", name="r", config={}, local_dir=tmp_path / "local")
+    event = {"step": 1}
+    t.log(event)
+    t.finish()
+    assert event == {"step": 1}  # no _t injected into the caller's dict
+
+
+def test_non_json_config_does_not_crash(tmp_path: Path):
+    """Paths, Enums, dtype-ish objects in config must never crash Tracker()."""
+    class FakeDtype:
+        def __str__(self):
+            return "torch.bfloat16"
+
+    t = Tracker(
+        project="p",
+        name="r",
+        config={"out_dir": Path("/tmp/x"), "dtype": FakeDtype()},
+        local_dir=tmp_path / "local",
+    )
+    t.finish()
+    cfg = json.loads((tmp_path / "local" / "p" / "r" / "config.json").read_text())
+    assert cfg["out_dir"] == "/tmp/x"
+    assert cfg["dtype"] == "torch.bfloat16"
+
+
+def test_log_after_finish_is_dropped_not_raised(tmp_path: Path, capsys):
+    t = _make_tracker(tmp_path, online=False)
+    t.log({"step": 1})
+    t.finish()
+    t.log({"step": 2})  # must not raise
+    t.log({"step": 3})
+    err = capsys.readouterr().err
+    assert err.count("log() after finish()") == 1  # warned exactly once
+    lines = (tmp_path / "local" / "p" / "r" / "metrics.jsonl").read_text().splitlines()
+    assert len(lines) == 1
+
+
+def test_late_init_retry_ships_events_when_server_recovers(tmp_path: Path):
+    """Server down at Tracker() start, up moments later: the daemon must
+    retry init and ship the session's events instead of going dark."""
+    state = {"init_calls": 0, "posted": []}
+
+    def handler(request):
+        path = request.url.path
+        if request.method == "POST" and "/init" in path:
+            state["init_calls"] += 1
+            # First two init attempts fail; third succeeds.
+            return httpx.Response(503 if state["init_calls"] < 3 else 200)
+        if request.method == "GET" and path.startswith("/api/runs/"):
+            return httpx.Response(200, json={"summary": {"num_events": 0}})
+        if request.method == "POST" and "/metrics" in path:
+            state["posted"].extend(json.loads(request.content))
+            return httpx.Response(200, json={"appended": 1})
+        if request.method == "POST" and "/finish" in path:
+            return httpx.Response(200)
+        return httpx.Response(404)
+
+    t = _make_tracker_with_handler(
+        tmp_path,
+        handler,
+        retry_delays=(),            # one attempt per init try
+        init_retry_interval=0.05,   # retry fast for the test
+    )
+    t.log({"step": 1})
+    deadline = time.time() + 5
+    while time.time() < deadline and len(state["posted"]) < 1:
+        time.sleep(0.02)
+    t.finish(timeout=5)
+    assert state["init_calls"] >= 3
+    assert {"step": 1} in state["posted"]
+
+
+def test_finish_warns_when_server_never_reachable(tmp_path: Path, capsys):
+    handler, _ = _mock_handler_factory([200], init_ok=False)
+    t = _make_tracker_with_handler(tmp_path, handler, retry_delays=())
+    t.log({"step": 1})
+    t.finish(timeout=5)
+    err = capsys.readouterr().err
+    assert "never reachable" in err
 
 
 def test_retry_does_not_run_on_trainer_thread(tmp_path: Path):

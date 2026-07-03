@@ -29,6 +29,7 @@ _DEFAULT_BATCH_INTERVAL = 5.0
 _DEFAULT_QUEUE_MAX = 10_000
 _DEFAULT_LOCAL_ROOT = "./endlex_runs"
 _DEFAULT_RETRY_DELAYS: tuple[float, ...] = (0.5, 1.0, 2.0)
+_DEFAULT_INIT_RETRY_INTERVAL = 30.0
 
 
 class Tracker:
@@ -48,13 +49,25 @@ class Tracker:
         queue_max: int = _DEFAULT_QUEUE_MAX,
         force: bool = False,
         retry_delays: tuple[float, ...] = _DEFAULT_RETRY_DELAYS,
+        auto_timestamp: bool = True,
+        init_retry_interval: float = _DEFAULT_INIT_RETRY_INTERVAL,
         _client: httpx.Client | None = None,  # test seam
     ) -> None:
         if not project or not name:
             raise ValueError("project and name are required")
         self.project = project
         self.name = name
-        self.config = dict(config or {})
+        # Round-trip through JSON with default=str so a config holding a Path,
+        # a torch.dtype, an Enum — common in real trainer configs — never
+        # crashes Tracker() or the daemon's POST /init. The sanitized dict is
+        # what's written locally AND sent to the server, so the server's
+        # same-config resume comparison sees identical values across restarts.
+        self.config = json.loads(
+            json.dumps(dict(config or {}), sort_keys=True, default=str)
+        )
+        self._auto_timestamp = bool(auto_timestamp)
+        self._init_retry_interval = float(init_retry_interval)
+        self._warned_after_finish = False
         self._url = (url if url is not None else os.environ.get("ENDLEX_URL")) or None
         self._token = (
             token if token is not None else os.environ.get("ENDLEX_TOKEN")
@@ -129,6 +142,24 @@ class Tracker:
     # ---------- hot path ----------
 
     def log(self, event: dict[str, Any]) -> None:
+        # A late log() after finish() must not raise into the training loop
+        # (the local file is closed by then). Warn once, drop.
+        if self._finished:
+            if not self._warned_after_finish:
+                self._warned_after_finish = True
+                import sys
+
+                print(
+                    f"[endlex] log() after finish() on '{self.name}' — dropped",
+                    file=sys.stderr,
+                )
+            return
+        # Stamp wall-clock time so time-axis plots and "when did this land"
+        # questions work without the trainer doing anything. Copy rather than
+        # mutate the caller's dict; both cost well under the 100 µs budget.
+        if self._auto_timestamp and "_t" not in event:
+            event = dict(event)
+            event["_t"] = time.time()
         line = json.dumps(event, separators=(",", ":"), sort_keys=True)
         # write+newline as two calls is fine: line buffering flushes on \n.
         self._local.write(line)
@@ -170,17 +201,19 @@ class Tracker:
         if self._thread is not None:
             self._thread.join(timeout=timeout)
         if self._client is not None:
-            # If events were dropped from the remote queue under backpressure
-            # they made it into the local JSONL but never into a batch.
-            # Compare server count to local line count and ship the gap.
-            if self._dropped > 0:
-                self._reconcile_at_finish()
-            # Best-effort: release the server-side lock so a restarted trainer
-            # can re-init this run without needing force=True.
-            try:
-                self._client.post(f"/api/runs/{self.name}/finish")
-            except Exception:
-                pass
+            if self._init_ok:
+                # If events were dropped from the remote queue under
+                # backpressure they made it into the local JSONL but never
+                # into a batch. Compare server count to local line count and
+                # ship the gap.
+                if self._dropped > 0:
+                    self._reconcile_at_finish()
+                # Best-effort: release the server-side lock so a restarted
+                # trainer can re-init this run without needing force=True.
+                try:
+                    self._client.post(f"/api/runs/{self.name}/finish")
+                except Exception:
+                    pass
             self._client.close()
         try:
             self._local.close()
@@ -189,6 +222,11 @@ class Tracker:
         # Surface any way the remote diverged from local — easy to miss
         # otherwise, since the trainer's hot path swallows all of this.
         warnings: list[str] = []
+        if self._client is not None and not self._init_ok:
+            warnings.append(
+                "server was never reachable — nothing shipped remotely "
+                "(local JSONL has everything; next run resyncs it)"
+            )
         if self._dropped > 0:
             warnings.append(
                 f"{self._dropped} events dropped from remote queue "
@@ -238,15 +276,26 @@ class Tracker:
     # ---------- daemon ----------
 
     def _loop(self) -> None:
-        if not self._init_remote():
-            return  # remote is dead; local file keeps recording
-        self._init_ok = True
-        self._resynced = self._resync_local_to_remote()
+        # A server that's down at startup must not cost the whole session:
+        # keep the daemon alive and retry init every _init_retry_interval.
+        # Until init succeeds nothing drains — events accumulate in the
+        # bounded queue (drop-oldest) and, always, in the local JSONL.
+        next_init_try = 0.0
         while not self._stop.is_set():
+            if not self._init_ok:
+                now = time.time()
+                if now >= next_init_try:
+                    if self._init_remote():
+                        self._init_ok = True
+                        self._resynced = self._resync_local_to_remote()
+                    else:
+                        next_init_try = now + self._init_retry_interval
             self._wake.wait(timeout=self.batch_interval)
             self._wake.clear()
-            self._drain_one_batch()
-        self._drain_all()
+            if self._init_ok:
+                self._drain_one_batch()
+        if self._init_ok:
+            self._drain_all()
 
     def _resync_local_to_remote(self) -> int:
         """Ship pre-existing local events that the server doesn't have yet.
@@ -358,22 +407,27 @@ class Tracker:
         return r is not None and r.status_code == 200
 
     def _drain_one_batch(self) -> None:
-        batch = self._take_batch()
-        if not batch:
-            return
-        self._in_flight = len(batch)
+        # Mark in-flight BEFORE popping: between popleft and the POST the
+        # events live only in a local variable, and flush() must not observe
+        # "queue empty + nothing in flight" during that window.
+        self._in_flight = 1
         try:
+            batch = self._take_batch()
+            if not batch:
+                return
+            self._in_flight = len(batch)
             self._post_batch(batch)
         finally:
             self._in_flight = 0
 
     def _drain_all(self) -> None:
         while True:
-            batch = self._take_batch()
-            if not batch:
-                return
-            self._in_flight = len(batch)
+            self._in_flight = 1
             try:
+                batch = self._take_batch()
+                if not batch:
+                    return
+                self._in_flight = len(batch)
                 ok = self._post_batch(batch)
             finally:
                 self._in_flight = 0
