@@ -1,13 +1,14 @@
 """``endlex`` command-line interface.
 
-The pull side of weights sync: list runs and fetch checkpoint files from the
-server to whatever box you're on (dev laptop, eval machine), with sha256
-verification against the server's manifest.
+Weights sync: list runs, and pull checkpoint files down from the server or push
+them up to it, with sha256 verification against the server's manifest.
 
     endlex runs                          # list runs
     endlex ckpts <run>                   # list a run's checkpoints
     endlex pull <run>                    # latest checkpoint -> ./<run>/<step>/
     endlex pull <run> --step 2000 --dest weights/ --files model.pt
+    endlex push <run> --dir CKPT_DIR     # upload the latest step's files in CKPT_DIR
+    endlex push <run> --dir CKPT_DIR --step 1920 --files model_001920.pt
 
 Server + auth come from ``ENDLEX_URL`` / ``ENDLEX_TOKEN`` (or --url/--token).
 """
@@ -17,12 +18,14 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import os
+import re
 import sys
+from pathlib import Path
 
 import httpx
 
 from endlex import __version__
-from endlex.checkpoint_sync import download_checkpoint
+from endlex.checkpoint_sync import download_checkpoint, upload_checkpoint
 
 
 def _client(args: argparse.Namespace) -> httpx.Client:
@@ -102,9 +105,57 @@ def _cmd_pull(args: argparse.Namespace) -> None:
         print(f"pulled {p} ({p.stat().st_size / 1e6:.1f} MB, sha256 verified)")
 
 
+def _cmd_push(args: argparse.Namespace) -> None:
+    d = Path(args.dir)
+    if not d.is_dir():
+        sys.exit(f"error: --dir {d} is not a directory")
+
+    # Resolve the step: explicit, else the highest one found among the dir's
+    # step-numbered files (e.g. model_001920.pt / optim_001920_rank0.pt).
+    step = args.step
+    if step is None:
+        steps = {
+            int(m.group(1))
+            for p in d.iterdir()
+            if p.is_file() and (m := re.search(r"_(\d{6})(?=[._])", p.name))
+        }
+        if not steps:
+            sys.exit(f"error: no step-numbered checkpoint files in {d} "
+                     "(expected e.g. model_001920.pt); pass --step")
+        step = max(steps)
+
+    tag = f"{step:06d}"
+    if args.files:
+        names = [n.strip() for n in args.files.split(",") if n.strip()]
+    else:
+        names = sorted(p.name for p in d.iterdir() if p.is_file() and tag in p.name)
+    if not names:
+        sys.exit(f"error: no files for step {step} in {d}")
+
+    files: dict[str, str] = {}
+    for name in names:
+        p = d / name
+        if not p.exists():
+            sys.exit(f"error: file not found: {p}")
+        files[name] = str(p)
+
+    total_mb = sum(os.path.getsize(v) for v in files.values()) / 1e6
+    print(f"pushing step {step} to run {args.run!r} ({len(files)} files, {total_mb:.0f} MB):")
+    for name, path in files.items():
+        print(f"    {name}  ({os.path.getsize(path) / 1e6:.1f} MB)")
+
+    # NOTE: do NOT hand upload_checkpoint the CLI's _client — let it build its own
+    # (fresh-connection-per-chunk + long timeout). Reusing a keep-alive client is
+    # exactly what triggers tunnel bad_record_mac on large chunked uploads.
+    ok = upload_checkpoint(args.run, step, files, url=args.url, token=args.token)
+    if not ok:
+        sys.exit("error: upload failed (see [endlex] messages above)")
+    print(f"pushed step {step} to {args.run} ({total_mb:.0f} MB, sha256-verified server-side)")
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
-        prog="endlex", description="Endlex client CLI (runs / checkpoints / pull)"
+        prog="endlex", description="Endlex client CLI (runs / checkpoints / pull / push)"
     )
     parser.add_argument("--version", action="version", version=f"endlex {__version__}")
     parser.add_argument("--url", help="server URL (default: $ENDLEX_URL)")
@@ -127,6 +178,16 @@ def main(argv: list[str] | None = None) -> None:
     )
     p_pull.add_argument("--files", help="comma-separated subset (default: all)")
     p_pull.set_defaults(fn=_cmd_pull)
+
+    p_push = sub.add_parser("push", help="upload a checkpoint's files to the server")
+    p_push.add_argument("run")
+    p_push.add_argument("--dir", default=".",
+                        help="local dir holding the checkpoint files (default: .)")
+    p_push.add_argument("--step", type=int, default=None,
+                        help="default: highest step found in --dir")
+    p_push.add_argument("--files",
+                        help="comma-separated basenames in --dir (default: all files for the step)")
+    p_push.set_defaults(fn=_cmd_push)
 
     args = parser.parse_args(argv)
     args.fn(args)
