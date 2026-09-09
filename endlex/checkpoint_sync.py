@@ -45,6 +45,16 @@ _DEFAULT_CHUNK_SIZE = 48 * 1024 * 1024
 
 _RETRY_DELAYS: tuple[float, ...] = (1.0, 3.0, 10.0)
 
+# Disable keep-alive on the transfer client. A checkpoint ships as many large
+# sequential chunk requests; pooling the TLS connection between them means a
+# connection that the tunnel (Cloudflare) has rotated/half-closed gets reused,
+# and the next chunk desyncs the TLS keystream -> SSLV3_ALERT_BAD_RECORD_MAC.
+# Retries then reuse the same poisoned pooled connection and give up. Forcing a
+# fresh connection per request (one extra handshake per ~48 MB chunk, negligible)
+# makes chunk uploads and their retries robust over tunnels. Metric streaming uses
+# a separate client and is unaffected.
+_NO_KEEPALIVE = httpx.Limits(max_keepalive_connections=0)
+
 
 def _log(msg: str) -> None:
     print(f"[endlex] {msg}", file=sys.stderr)
@@ -252,7 +262,7 @@ def upload_checkpoint(
         owns_client = False
     else:
         headers = {"Authorization": f"Bearer {token}"} if token else {}
-        client = httpx.Client(base_url=url, headers=headers, timeout=timeout)
+        client = httpx.Client(base_url=url, headers=headers, timeout=timeout, limits=_NO_KEEPALIVE)
         owns_client = True
 
     try:
@@ -340,7 +350,7 @@ def download_checkpoint(
         owns_client = False
     else:
         headers = {"Authorization": f"Bearer {token}"} if token else {}
-        client = httpx.Client(base_url=url, headers=headers, timeout=timeout)
+        client = httpx.Client(base_url=url, headers=headers, timeout=timeout, limits=_NO_KEEPALIVE)
         owns_client = True
 
     try:
